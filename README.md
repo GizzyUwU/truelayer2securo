@@ -155,6 +155,18 @@ does not match. `egress refused: ... is not allowed` in
 `docker compose logs plugins-egress` means the installed manifest is stale and
 must be updated.
 
+Version **1.1.3+** also logs one balance line per account on every sync:
+
+```text
+truelayer_plugin.sync balance external_id=account:abc type=checking source=provider pending_total=-2.00 reported=98.00
+```
+
+`source=provider` means TrueLayer supplied `current`; `source=transactions` means
+the balance was derived from the imported rows because neither `/balance` nor a
+running balance was available. Either way the reported balance includes the
+signed pending total so Securo's synthetic opening-balance row does not absorb
+the holds.
+
 ## Test locally before publishing
 
 The plugin has no third-party dependencies, so a local catalog is enough:
@@ -193,7 +205,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.1.2`).
+3. Publish a release (for example `v1.1.3`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 

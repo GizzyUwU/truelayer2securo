@@ -558,18 +558,22 @@ def _running_balance(transactions: list[dict[str, Any]] | None) -> dict[str, Any
     return found
 
 
-def _pending_signed_total(transactions: list[dict[str, Any]] | None, today: dt.date) -> Decimal:
-    """Signed sum of pending rows Securo will count towards the balance.
+def _signed_total(
+    transactions: list[dict[str, Any]] | None,
+    today: dt.date,
+    *,
+    pending_only: bool = False,
+) -> Decimal:
+    """Signed sum of the rows Securo counts towards the balance.
 
     Securo's synthetic opening-balance transaction closes the gap between the
     account balance and the sum of its imported transactions, and it counts
-    pending rows dated today or earlier. TrueLayer's `current` balance excludes
-    pending transactions, so we report a balance with them included instead.
+    pending rows dated today or earlier. Future-dated rows never count.
     """
     total = Decimal("0")
     cutoff = today.isoformat()
     for transaction in transactions or []:
-        if transaction.get("status") != "pending":
+        if pending_only and transaction.get("status") != "pending":
             continue
         date = transaction.get("date")
         if not date or date > cutoff:
@@ -746,6 +750,10 @@ class Plugin:
             if current is None:
                 running = _running_balance(raw_transactions)
                 current = running.get("amount") if running else None
+
+            pending_total = _signed_total(transactions, today, pending_only=True)
+            is_liability = account_type in LIABILITY_ACCOUNT_TYPES
+            balance_source = "state"
             if current is not None:
                 try:
                     base = Decimal(str(current))
@@ -758,11 +766,25 @@ class Plugin:
                     # keeps the opening balance at its pre-pending value. For
                     # liabilities Securo works from the negated debt, so the
                     # pending total moves the reported debt the other way.
-                    pending_total = _pending_signed_total(transactions, today)
-                    is_liability = account_type in LIABILITY_ACCOUNT_TYPES
                     reported = base - pending_total if is_liability else base + pending_total
                     balances[external_id] = _money(reported)
+                    balance_source = "provider"
+            elif transactions is not None:
+                # No `/balance` and no running balance. Derive the balance from
+                # the rows Securo will count, otherwise its synthetic opening
+                # absorbs the pending holds (a +2 hold with balance 0 becomes
+                # a -2 opening balance). Liabilities are stored as positive
+                # debt, hence the negated total.
+                total = _signed_total(transactions, today)
+                balances[external_id] = _money(-total if is_liability else total)
+                balance_source = "transactions"
             current_balance = balances.get(external_id, "0.00")
+            print(
+                f"truelayer_plugin.sync balance external_id={external_id} type={account_type} "
+                f"source={balance_source} pending_total={pending_total} reported={current_balance}",
+                file=sys.stderr,
+                flush=True,
+            )
 
             account = _map_account(
                 record,
