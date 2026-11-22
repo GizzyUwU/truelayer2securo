@@ -36,7 +36,7 @@ same expiry/reconnect state).
 
 ## Requirements
 
-- Securo **0.20.0+** with code plugins enabled and the plugin runner running.
+- Securo **0.21.0+** with code plugins enabled and the plugin runner running.
 - A TrueLayer application with a registered redirect URI.
 
 ## Install on your Securo instance
@@ -99,7 +99,7 @@ starts with `sandbox-` to switch all API calls to the sandbox hosts.
 
 ## Pending transactions and the opening balance
 
-The plugin (version **1.1.0+**) also reads TrueLayer's dedicated pending feed
+The plugin (version **1.1.1+**) also reads TrueLayer's dedicated pending feed
 for both accounts and cards:
 
 - `GET /data/v1/accounts/{id}/transactions/pending`
@@ -122,9 +122,12 @@ the other way; cards configured as `checking` or `savings` are adjusted as
 assets. A manual edit to Securo's opening balance is overwritten on the next
 sync.
 
-The manifest sets `complete_feed: true`: if a pending row stops appearing in
-the feed without posting, Securo can expire it as cancelled rather than leaving
-a stale hold counted forever.
+Securo 0.21.0 does not support the `complete_feed` manifest flag, so this
+manifest deliberately omits it. A hold that is cancelled at the provider
+rather than posted will therefore stay pending in 0.21.0 until removed
+manually. Future Securo versions that support `complete_feed` can enable
+cancelled-hold expiry by declaring it, but the field must not be present for a
+0.21.0 install.
 
 ## Test locally before publishing
 
@@ -164,7 +167,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.1.0`).
+3. Publish a release (for example `v1.1.1`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 
@@ -172,7 +175,7 @@ The catalog picks it up on its next rebuild (about every 6 hours).
 
 ```
 truelayer_plugin.py      # OAuth, TrueLayer client, mapping, sync (stdlib only)
-securo-plugin.json       # manifest: oauth integration, network, provides, complete_feed
+securo-plugin.json       # manifest: oauth integration, network, provides
 test_truelayer_plugin.py # stdlib unit tests
 .env                     # generated local Compose settings; ignored by git
 .env.example             # sanitized production template; safe to commit

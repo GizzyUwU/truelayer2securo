@@ -525,7 +525,9 @@ class ManifestTests(unittest.TestCase):
         integration = manifest["contributes"]["integrations"][0]
         self.assertEqual(integration["auth"], "oauth")
         self.assertEqual(integration["provides"], ["accounts", "transactions"])
-        self.assertTrue(integration["complete_feed"])
+        # Securo 0.21.0 rejects unknown integration fields; `complete_feed`
+        # was added after that release, so it must stay out of the manifest.
+        self.assertNotIn("complete_feed", integration)
         fields = {field["key"] for field in integration["fields"]}
         self.assertTrue({"client_id", "client_secret"} <= fields)
         hosts = {entry["host"] for entry in manifest["network"]}
