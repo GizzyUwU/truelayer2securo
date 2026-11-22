@@ -9,6 +9,7 @@ import json
 import pathlib
 import unittest
 import urllib.parse
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -158,6 +159,13 @@ class MappingTests(unittest.TestCase):
         card = plugin_module.map_transactions([txns[1]], "card:c1", is_card=True)
         self.assertEqual(card[0]["type"], "debit")
 
+        # TrueLayer card refunds arrive negative; they are credits, not debits.
+        refund = plugin_module.map_transactions(
+            [{**txns[1], "amount": -2.0, "transaction_type": "DEBIT"}], "card:c1", is_card=True
+        )
+        self.assertEqual(refund[0]["type"], "credit")
+        self.assertEqual(refund[0]["amount"], "2.00")
+
     def test_duplicate_ids_prefer_posted(self):
         base = {
             "transaction_id": "same",
@@ -219,6 +227,8 @@ class SyncTests(unittest.TestCase):
                 return {"results": [account], "status": "success"}
             if url.endswith("/data/v1/cards"):
                 return {"results": [card], "status": "success"}
+            if "/transactions/pending" in url:
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
                 self.assertIn("from=2026-11-15", url)
                 return {"results": [account_txn], "status": "success"}
@@ -255,7 +265,9 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual(credit["external_id"], "card:card-1")
         self.assertEqual(credit["type"], "credit_card")
-        self.assertEqual(credit["balance"], "50.00")
+        # `current` (50) excludes the pending 30 purchase; the reported
+        # balance includes it so Securo's opening balance stays unchanged.
+        self.assertEqual(credit["balance"], "80.00")
         self.assertEqual(credit["masked_number"], "4242")
         self.assertEqual(credit["transactions"][0]["type"], "debit")
         self.assertEqual(credit["transactions"][0]["status"], "pending")
@@ -263,6 +275,229 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(result["state"]["balances"]["account:acc-1"], "123.45")
         self.assertEqual(result["state"]["consent_status"], "active")
         self.assertNotIn("secrets", result)
+
+    def test_pending_feed_is_imported_without_shifting_opening_balance(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        settled = {
+            "transaction_id": "t-1",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -5.0,
+            "transaction_type": "DEBIT",
+            "description": "COFFEE",
+        }
+        hold = {
+            "transaction_id": "hold-1",
+            "timestamp": f"{today}T11:00:00Z",
+            "amount": 2.0,
+            "transaction_type": "CREDIT",
+            "description": "REFUND",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/accounts/acc-1/transactions/pending" in url:
+                return {"results": [hold]}
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [settled]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 100.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        synced = result["data"]["accounts"][0]
+        self.assertEqual(synced["balance"], "102.00")
+        transactions = {tx["external_id"]: tx for tx in synced["transactions"]}
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions["account:acc-1:hold-1"]["status"], "pending")
+        self.assertEqual(transactions["account:acc-1:hold-1"]["type"], "credit")
+
+        signed = sum(
+            (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
+            for tx in transactions.values()
+        )
+        # The opening balance Securo derives is unchanged by importing the hold.
+        self.assertEqual(Decimal(synced["balance"]) - signed, Decimal("105.00"))
+
+    def test_pending_row_in_dated_feed_is_marked_pending_once(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        row = {
+            "transaction_id": "same",
+            "normalised_provider_transaction_id": "stable-same",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -2.0,
+            "transaction_type": "DEBIT",
+            "description": "CARD HOLD",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/accounts/acc-1/transactions/pending" in url:
+                return {"results": [row]}
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [row]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 50.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        transactions = result["data"]["accounts"][0]["transactions"]
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["status"], "pending")
+        # -2 hold is not in `current`, so the reported balance includes it.
+        self.assertEqual(result["data"]["accounts"][0]["balance"], "48.00")
+
+    def test_unsupported_pending_feed_keeps_settled_transactions(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        settled = {
+            "transaction_id": "t-1",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -5.0,
+            "transaction_type": "DEBIT",
+            "description": "COFFEE",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/transactions/pending" in url:
+                raise UpstreamError(501, "not supported", "endpoint_not_supported")
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [settled]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 100.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        synced = result["data"]["accounts"][0]
+        self.assertEqual(synced["balance"], "100.00")
+        self.assertEqual(len(synced["transactions"]), 1)
+        self.assertEqual(synced["transactions"][0]["status"], "posted")
+
+    def test_card_pending_purchases_and_refunds_adjust_debt(self):
+        today = plugin_module.dt.date.today().isoformat()
+        card = {"account_id": "card-1", "display_name": "Card", "currency": "GBP"}
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": []}
+            if url.endswith("/data/v1/cards"):
+                return {"results": [card]}
+            if "/cards/card-1/transactions/pending" in url:
+                return {
+                    "results": [
+                        {
+                            "transaction_id": "hold-buy",
+                            "timestamp": f"{today}T10:00:00Z",
+                            "amount": 20.0,
+                            "description": "PENDING SHOP",
+                        },
+                        {
+                            "transaction_id": "hold-refund",
+                            "timestamp": f"{today}T11:00:00Z",
+                            "amount": -5.0,
+                            "description": "PENDING REFUND",
+                        },
+                    ]
+                }
+            if "/cards/card-1/transactions" in url:
+                return {
+                    "results": [
+                        {
+                            "transaction_id": "posted-buy",
+                            "timestamp": f"{today}T09:00:00Z",
+                            "amount": 30.0,
+                            "description": "POSTED SHOP",
+                        }
+                    ]
+                }
+            if "/cards/card-1/balance" in url:
+                return {"results": [{"current": 50.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        synced = result["data"]["accounts"][0]
+        self.assertEqual(synced["balance"], "65.00")
+        by_id = {tx["external_id"]: tx for tx in synced["transactions"]}
+        self.assertEqual(by_id["card:card-1:hold-buy"]["type"], "debit")
+        self.assertEqual(by_id["card:card-1:hold-buy"]["status"], "pending")
+        self.assertEqual(by_id["card:card-1:hold-refund"]["type"], "credit")
+        self.assertEqual(by_id["card:card-1:hold-refund"]["status"], "pending")
+
+        signed = sum(
+            (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
+            for tx in by_id.values()
+        )
+        # The remaining -20 is the debt from before this 7-day window;
+        # importing the holds does not change it.
+        self.assertEqual(-Decimal(synced["balance"]) - signed, Decimal("-20.00"))
+
+    def test_checking_card_pending_purchase_keeps_asset_opening_balance(self):
+        today = plugin_module.dt.date.today().isoformat()
+        card = {"account_id": "card-1", "display_name": "Debit Card", "currency": "GBP"}
+        hold = {
+            "transaction_id": "hold-buy",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": 20.0,
+            "description": "PENDING SHOP",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": []}
+            if url.endswith("/data/v1/cards"):
+                return {"results": [card]}
+            if "/cards/card-1/transactions/pending" in url:
+                return {"results": [hold]}
+            if "/cards/card-1/transactions" in url:
+                return {"results": []}
+            if "/cards/card-1/balance" in url:
+                return {"results": [{"current": 50.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        ctx = valid_context()
+        ctx.config["card_kind"] = "checking"
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, ctx)
+
+        synced = result["data"]["accounts"][0]
+        self.assertEqual(synced["type"], "checking")
+        # A debit card's balance is money owned: a 20 purchase lowers it.
+        self.assertEqual(synced["balance"], "30.00")
+        self.assertEqual(synced["transactions"][0]["type"], "debit")
+        # The opening balance Securo derives stays at the pre-pending 50.
+        self.assertEqual(
+            Decimal(synced["balance"]) + Decimal(synced["transactions"][0]["amount"]),
+            Decimal("50.00"),
+        )
 
     def test_empty_response_does_not_look_like_closed_accounts(self):
         with patch.object(plugin_module, "_request", return_value={"results": []}):
@@ -290,6 +525,7 @@ class ManifestTests(unittest.TestCase):
         integration = manifest["contributes"]["integrations"][0]
         self.assertEqual(integration["auth"], "oauth")
         self.assertEqual(integration["provides"], ["accounts", "transactions"])
+        self.assertTrue(integration["complete_feed"])
         fields = {field["key"] for field in integration["fields"]}
         self.assertTrue({"client_id", "client_secret"} <= fields)
         hosts = {entry["host"] for entry in manifest["network"]}

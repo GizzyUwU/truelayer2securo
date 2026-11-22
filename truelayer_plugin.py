@@ -39,6 +39,7 @@ HOSTS = frozenset(
     }
 )
 CARD_KINDS = frozenset({"credit_card", "checking", "savings"})
+LIABILITY_ACCOUNT_TYPES = frozenset({"credit_card", "loan"})
 
 
 class NeedsAuth(Exception):
@@ -194,6 +195,11 @@ def _fetch_balance(url: str, token: str) -> dict[str, Any] | None:
     results = payload.get("results") or []
     first = results[0] if results else None
     return first if isinstance(first, dict) else None
+
+
+def _as_pending(transaction: dict[str, Any]) -> dict[str, Any]:
+    """TrueLayer's pending feed has no status field, but Securo needs one."""
+    return {**transaction, "status": "pending"}
 
 
 # ---------------------------------------------------------------------------
@@ -398,10 +404,14 @@ def map_transactions(
             continue
 
         explicit = str(transaction.get("transaction_type") or "").strip().lower()
-        if explicit in ("debit", "credit"):
+        if is_card and signed != 0:
+            # TrueLayer card amounts are positive for purchases (money out)
+            # and negative for refunds (money back), the reverse of accounts.
+            # transaction_type is not always present on pending rows.
+            kind = "debit" if signed > 0 else "credit"
+        elif explicit in ("debit", "credit"):
             kind = explicit
         elif is_card:
-            # Card purchases arrive positive but still increase what is owed.
             kind = "debit"
         else:
             kind = "debit" if signed < 0 else "credit"
@@ -454,6 +464,27 @@ def _running_balance(transactions: list[dict[str, Any]] | None) -> dict[str, Any
     return found
 
 
+def _pending_signed_total(transactions: list[dict[str, Any]] | None, today: dt.date) -> Decimal:
+    """Signed sum of pending rows Securo will count towards the balance.
+
+    Securo's synthetic opening-balance transaction closes the gap between the
+    account balance and the sum of its imported transactions, and it counts
+    pending rows dated today or earlier. TrueLayer's `current` balance excludes
+    pending transactions, so we report a balance with them included instead.
+    """
+    total = Decimal("0")
+    cutoff = today.isoformat()
+    for transaction in transactions or []:
+        if transaction.get("status") != "pending":
+            continue
+        date = transaction.get("date")
+        if not date or date > cutoff:
+            continue
+        amount = Decimal(str(transaction["amount"]))
+        total += amount if transaction["type"] == "credit" else -amount
+    return total
+
+
 def _resolve_since(since: Any, history_days: int, today: dt.date) -> str:
     """Securo's overlap (14 days) and our own lookback; take the wider window."""
     floor = (today - dt.timedelta(days=history_days)).isoformat()
@@ -473,7 +504,7 @@ def _map_account(
     is_card: bool,
     current_balance: str,
     currency_hint: Any,
-    card_kind: str,
+    account_type: str,
 ) -> dict[str, Any]:
     provider = record.get("provider")
     institution = provider.get("display_name") if isinstance(provider, dict) else None
@@ -481,7 +512,7 @@ def _map_account(
     account: dict[str, Any] = {
         "external_id": external_id,
         "name": _clip(record.get("display_name") or fallback_name, 255),
-        "type": card_kind if is_card else _account_type(record),
+        "type": account_type,
         "balance": current_balance,
         "currency": _currency(record.get("currency") or currency_hint),
         "institution_name": _clip(institution, 255) or None,
@@ -565,6 +596,7 @@ class Plugin:
         }
         today = dt.date.today()
         since = _resolve_since(params.get("since"), _history_days(context), today)
+        card_kind = _card_kind(context)
 
         # Account and card feeds are separate at TrueLayer. Fetch once per
         # account, reusing the result for all of Securo's downstream matching.
@@ -584,22 +616,55 @@ class Plugin:
 
             quoted = urllib.parse.quote(account_id, safe="")
             kind = "cards" if is_card else "accounts"
+            account_type = card_kind if is_card else _account_type(record)
             raw_transactions = _fetch_collection(
                 f"{api}/data/v1/{kind}/{quoted}/transactions?from={since}&to={today.isoformat()}",
                 access_token,
             )
-            transactions = (
-                map_transactions(raw_transactions, external_id, is_card=is_card)
-                if raw_transactions is not None
-                else None
+            # TrueLayer's dated feed can include pending rows, but it does not
+            # promise them. The dedicated pending feed is authoritative for
+            # holds (it also returns ones dated outside the window). 404/501
+            # means the provider has no pending feed; keep the settled rows.
+            pending = _fetch_collection(
+                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", access_token
             )
+            transactions = None
+            if raw_transactions is not None:
+                feed = list(raw_transactions)
+                if pending:
+                    pending_ids = {
+                        _stable_external_id(item, external_id) for item in pending
+                    }
+                    feed = [
+                        _as_pending(item)
+                        if _stable_external_id(item, external_id) in pending_ids
+                        else item
+                        for item in feed
+                    ]
+                    feed.extend(_as_pending(item) for item in pending)
+                transactions = map_transactions(feed, external_id, is_card=is_card)
+
             balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", access_token)
             current = balance.get("current") if balance else None
             if current is None:
                 running = _running_balance(raw_transactions)
                 current = running.get("amount") if running else None
             if current is not None:
-                balances[external_id] = _money(current)
+                try:
+                    base = Decimal(str(current))
+                except (InvalidOperation, ValueError, TypeError):
+                    base = None
+                if base is not None:
+                    # Securo counts pending rows when it derives the synthetic
+                    # opening-balance transaction. TrueLayer's `current` does
+                    # not, so include their signed total here instead; that
+                    # keeps the opening balance at its pre-pending value. For
+                    # liabilities Securo works from the negated debt, so the
+                    # pending total moves the reported debt the other way.
+                    pending_total = _pending_signed_total(transactions, today)
+                    is_liability = account_type in LIABILITY_ACCOUNT_TYPES
+                    reported = base - pending_total if is_liability else base + pending_total
+                    balances[external_id] = _money(reported)
             current_balance = balances.get(external_id, "0.00")
 
             account = _map_account(
@@ -608,7 +673,7 @@ class Plugin:
                 is_card=is_card,
                 current_balance=current_balance,
                 currency_hint=(balance or {}).get("currency"),
-                card_kind=_card_kind(context),
+                account_type=account_type,
             )
             # None means the feed could not be fetched; an empty list means it
             # was fetched and is empty. Securo treats those differently.

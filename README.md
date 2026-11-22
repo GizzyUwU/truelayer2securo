@@ -21,6 +21,7 @@ synced records.
 | Accounts **and** cards | Both, as separate TrueLayer feeds; cards default to Securo `credit_card` accounts |
 | Stable `normalised_provider_transaction_id` for dedupe | Same, prefixed with the account ID to avoid cross-account collisions |
 | 7-day lookback so pending transactions settle | Securo's 14-day overlap is used; first sync defaults to 7 days |
+| Re-read pending transactions | Dedicated TrueLayer pending feed for accounts **and** cards, merged with the dated feed and marked `pending` |
 | Payee from `merchant_name`, notes from `description` | Payee from `merchant_name`, description from `description`; classification becomes Securo's provider category |
 | Per-bank isolation; one dead bank doesn't stop the rest | One Securo plugin connection per bank, each with its own status and schedule |
 | Consent expiry / reauth prompts | 401/403 become `NeedsAuth`, shown as an expired bank connection with a reconnect action |
@@ -96,6 +97,35 @@ starts with `sandbox-` to switch all API calls to the sandbox hosts.
 5. **Sync now** works from the connection card. Reconnect after consent
    expires; account IDs are stable, so nothing is imported twice.
 
+## Pending transactions and the opening balance
+
+The plugin (version **1.1.0+**) also reads TrueLayer's dedicated pending feed
+for both accounts and cards:
+
+- `GET /data/v1/accounts/{id}/transactions/pending`
+- `GET /data/v1/cards/{id}/transactions/pending`
+
+Rows found there are marked `pending` in Securo, deduplicated by TrueLayer's
+stable transaction ID and merged with the dated transactions feed. A settled
+copy of the same hold is marked pending too, so it is not imported twice.
+Providers that answer `404`/`501` simply keep the settled feed; nothing fails.
+Securo's **Import pending** connection setting must stay enabled (it is on by
+default) for these rows to appear.
+
+TrueLayer's `current` balance excludes pending transactions, while Securo
+counts them when it derives its synthetic opening-balance transaction. The
+plugin therefore reports a balance that includes the signed pending total;
+Securo's derived opening balance stays at its pre-pending value instead of
+absorbing a hold (for example, a pending £2 credit no longer creates a `-£2`
+opening-balance row). Credit cards report positive debt, so the adjustment runs
+the other way; cards configured as `checking` or `savings` are adjusted as
+assets. A manual edit to Securo's opening balance is overwritten on the next
+sync.
+
+The manifest sets `complete_feed: true`: if a pending row stops appearing in
+the feed without posting, Securo can expire it as cancelled rather than leaving
+a stale hold counted forever.
+
 ## Test locally before publishing
 
 The plugin has no third-party dependencies, so a local catalog is enough:
@@ -134,7 +164,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.0.0`).
+3. Publish a release (for example `v1.1.0`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 
@@ -142,7 +172,7 @@ The catalog picks it up on its next rebuild (about every 6 hours).
 
 ```
 truelayer_plugin.py      # OAuth, TrueLayer client, mapping, sync (stdlib only)
-securo-plugin.json       # manifest: oauth integration, network, provides
+securo-plugin.json       # manifest: oauth integration, network, provides, complete_feed
 test_truelayer_plugin.py # stdlib unit tests
 .env                     # generated local Compose settings; ignored by git
 .env.example             # sanitized production template; safe to commit
