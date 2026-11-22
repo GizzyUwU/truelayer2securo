@@ -1,0 +1,77 @@
+{
+  "id": "gizzy/truelayer2securo",
+  "name": "TrueLayer",
+  "description": "Sync UK bank accounts and cards from TrueLayer into Securo: stable transaction IDs, pending re-reads, balances and automatic token refresh.",
+  "version": "1.0.0",
+  "repository": "https://github.com/gizzy/truelayer2securo",
+  "license": "MIT",
+  "min_securo_version": "0.20.0",
+  "runtime": {
+    "entrypoint": "truelayer_plugin:plugin"
+  },
+  "network": [
+    {
+      "host": "auth.truelayer.com",
+      "purpose": "Signs you in at your bank and exchanges the authorization code for API tokens."
+    },
+    {
+      "host": "auth.truelayer-sandbox.com",
+      "purpose": "Same sign-in for sandbox apps, whose client ID starts with sandbox-."
+    },
+    {
+      "host": "api.truelayer.com",
+      "purpose": "Reads accounts, cards, balances and transactions through the TrueLayer Data API."
+    },
+    {
+      "host": "api.truelayer-sandbox.com",
+      "purpose": "Same data reads for sandbox apps."
+    }
+  ],
+  "contributes": {
+    "integrations": [
+      {
+        "key": "truelayer",
+        "name": "TrueLayer",
+        "description": "Sign in with your bank through TrueLayer. Accounts, cards and transactions sync as a connected bank in Securo.",
+        "auth": "oauth",
+        "fields": [
+          {
+            "key": "client_id",
+            "label": "TrueLayer client ID",
+            "required": true,
+            "secret": false
+          },
+          {
+            "key": "client_secret",
+            "label": "TrueLayer client secret",
+            "required": true,
+            "secret": true
+          },
+          {
+            "key": "providers",
+            "label": "Providers (optional, space separated)",
+            "required": false,
+            "secret": false
+          },
+          {
+            "key": "history_days",
+            "label": "Days of history on first sync (optional, default 7)",
+            "required": false,
+            "secret": false
+          },
+          {
+            "key": "card_kind",
+            "label": "Card account type: credit_card (default), checking or savings",
+            "required": false,
+            "secret": false
+          }
+        ],
+        "sync_minutes": 360,
+        "provides": [
+          "accounts",
+          "transactions"
+        ]
+      }
+    ]
+  }
+}
