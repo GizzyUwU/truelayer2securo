@@ -193,7 +193,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.1.1`).
+3. Publish a release (for example `v1.1.2`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 
