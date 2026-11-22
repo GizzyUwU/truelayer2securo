@@ -284,7 +284,10 @@ class SyncTests(unittest.TestCase):
                 }
             raise AssertionError(f"unexpected URL: {url}")
 
-        with patch.object(plugin_module, "_request", side_effect=fake_request):
+        stderr = io.StringIO()
+        with patch.object(plugin_module, "_request", side_effect=fake_request), patch.object(
+            sys, "stderr", stderr
+        ):
             result = plugin_module.plugin.sync({}, valid_context())
 
         data = result["data"]
@@ -293,7 +296,13 @@ class SyncTests(unittest.TestCase):
         checking, credit = data["accounts"]
         self.assertEqual(checking["external_id"], "account:acc-1")
         self.assertEqual(checking["type"], "checking")
-        self.assertEqual(checking["balance"], "123.45")
+        # Spendable accounts report `available`, the bank-app figure.
+        self.assertEqual(checking["balance"], "100.00")
+        self.assertIn(
+            "field=available current=123.45 available=100.0 "
+            "pending_total=0 posted_total=-5.50 reported=100.00",
+            stderr.getvalue(),
+        )
         self.assertEqual(checking["institution_name"], "Mock Bank")
         self.assertEqual(checking["transactions"][0]["external_id"], "account:acc-1:stable-1")
 
@@ -301,15 +310,59 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(credit["type"], "credit_card")
         # TrueLayer's `current` (50) excludes the pending 30 purchase. The row
         # stays visible, but is balance-neutral, so no adjustment is needed.
+        # A liability keeps `current`: `available` there is remaining credit.
         self.assertEqual(credit["balance"], "50.00")
+        self.assertIn("type=credit_card source=provider field=current", stderr.getvalue())
         self.assertEqual(credit["masked_number"], "4242")
         self.assertEqual(credit["transactions"][0]["type"], "debit")
         self.assertEqual(credit["transactions"][0]["status"], "pending")
         self.assertEqual(credit["transactions"][0]["currency"], "XXX")
 
-        self.assertEqual(result["state"]["balances"]["account:acc-1"], "123.45")
+        self.assertEqual(result["state"]["balances"]["account:acc-1"], "100.00")
         self.assertEqual(result["state"]["consent_status"], "active")
         self.assertNotIn("secrets", result)
+
+    def test_balance_field_current_uses_settled_figure(self):
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [{"account_id": "acc-1", "currency": "GBP"}]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": []}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 18.14, "available": 17.10, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        ctx = valid_context()
+        ctx.config["balance_field"] = "current"
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, ctx)
+        self.assertEqual(result["data"]["accounts"][0]["balance"], "18.14")
+
+    def test_debit_card_uses_available_like_an_account(self):
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": []}
+            if url.endswith("/data/v1/cards"):
+                return {"results": [{"account_id": "card-1", "currency": "GBP"}]}
+            if "/cards/card-1/transactions" in url:
+                return {"results": []}
+            if "/cards/card-1/balance" in url:
+                return {"results": [{"current": 18.14, "available": 17.10, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        ctx = valid_context()
+        ctx.config["card_kind"] = "checking"
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, ctx)
+        account = result["data"]["accounts"][0]
+        self.assertEqual(account["type"], "checking")
+        self.assertEqual(account["balance"], "17.10")
 
     def test_pending_row_in_dated_feed_is_visible_but_balance_neutral(self):
         today = plugin_module.dt.date.today().isoformat()
@@ -644,7 +697,7 @@ class ManifestTests(unittest.TestCase):
         # was added after that release, so it must stay out of the manifest.
         self.assertNotIn("complete_feed", integration)
         fields = {field["key"] for field in integration["fields"]}
-        self.assertTrue({"client_id", "client_secret"} <= fields)
+        self.assertTrue({"client_id", "client_secret", "balance_field"} <= fields)
         hosts = {entry["host"] for entry in manifest["network"]}
         self.assertTrue(hosts <= plugin_module.HOSTS)
 

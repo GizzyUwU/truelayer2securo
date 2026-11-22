@@ -2,7 +2,7 @@
   "id": "gizzy/truelayer2securo",
   "name": "TrueLayer",
   "description": "Sync UK bank accounts and cards from TrueLayer into Securo: stable transaction IDs, pending transactions, balances and automatic token refresh.",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "repository": "https://github.com/gizzy/truelayer2securo",
   "license": "MIT",
   "min_securo_version": "0.21.0",
@@ -62,6 +62,12 @@
           {
             "key": "card_kind",
             "label": "Card account type: credit_card (default), checking or savings",
+            "required": false,
+            "secret": false
+          },
+          {
+            "key": "balance_field",
+            "label": "Balance to report: available (default, spendable) or current (settled)",
             "required": false,
             "secret": false
           }

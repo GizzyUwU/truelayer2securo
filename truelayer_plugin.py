@@ -44,11 +44,14 @@ HOSTS = frozenset(
 )
 CARD_KINDS = frozenset({"credit_card", "checking", "savings"})
 LIABILITY_ACCOUNT_TYPES = frozenset({"credit_card", "loan"})
+BALANCE_FIELDS = frozenset({"available", "current"})
+DEFAULT_BALANCE_FIELD = "available"
 # Securo sums every imported row when it derives the synthetic opening balance,
-# including pending ones. TrueLayer's `current` balance excludes holds, and
-# truelayer2actual leaves uncleared rows out of the balance too. A pending row
-# carries an unconvertible currency so Securo's balance maths sees zero while
-# the row itself stays visible with its original amount.
+# including pending ones. A pending row carries an unconvertible currency so
+# Securo's balance maths sees zero while the row itself stays visible with its
+# original amount. The balance we report comes from TrueLayer's `available`
+# for spendable accounts, the number the bank app shows after pending holds;
+# liabilities keep `current`, where `available` means remaining credit instead.
 PENDING_CURRENCY = "XXX"
 PENDING_FALLBACK_CURRENCY = "ZZZ"
 
@@ -321,6 +324,12 @@ def _history_days(context: Any) -> int:
 def _card_kind(context: Any) -> str:
     value = str(context.config.get("card_kind") or "credit_card").strip().lower()
     return value if value in CARD_KINDS else "credit_card"
+
+
+def _balance_field(context: Any) -> str:
+    """Which TrueLayer balance figure to report for spendable accounts."""
+    value = str(context.config.get("balance_field") or "").strip().lower()
+    return value if value in BALANCE_FIELDS else DEFAULT_BALANCE_FIELD
 
 
 # ---------------------------------------------------------------------------
@@ -731,10 +740,23 @@ class Plugin:
                 access_token,
             )
             balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", access_token)
-            current = balance.get("current") if balance else None
+            provider_current = balance.get("current") if balance else None
+            available = balance.get("available") if balance else None
+            # `available` is the spendable figure the bank app shows after
+            # pending holds. For a liability it is the credit still left rather
+            # than the debt owed, so `current` stays authoritative there.
+            use_available = (
+                _balance_field(context) == "available"
+                and account_type not in LIABILITY_ACCOUNT_TYPES
+                and available is not None
+            )
+            current = available if use_available else provider_current
             if current is None:
                 running = _running_balance(raw_transactions)
                 current = running.get("amount") if running else None
+                source_field = "running" if current is not None else "state"
+            else:
+                source_field = "available" if use_available else "current"
             currency_hint = _currency(record.get("currency") or (balance or {}).get("currency"))
 
             # TrueLayer's dated endpoint returns settled rows only; holds live
@@ -765,9 +787,9 @@ class Plugin:
                 except (InvalidOperation, ValueError, TypeError):
                     base = None
                 if base is not None:
-                    # `current` already excludes holds, and pending rows no
-                    # longer contribute to Securo's opening-balance sum. No
-                    # adjustment: the provider's number is the right target.
+                    # The selected provider figure is what the bank shows the
+                    # person. Pending rows are balance-neutral in Securo, so no
+                    # adjustment: this number is the right target as-is.
                     balances[external_id] = _money(base)
                     balance_source = "provider"
             elif transactions is not None:
@@ -779,7 +801,9 @@ class Plugin:
             current_balance = balances.get(external_id, "0.00")
             print(
                 f"truelayer_plugin.sync balance external_id={external_id} type={account_type} "
-                f"source={balance_source} pending_total={pending_total} "
+                f"source={balance_source} field={source_field} "
+                f"current={provider_current} available={available} "
+                f"pending_total={pending_total} "
                 f"posted_total={posted_total} reported={current_balance}",
                 file=sys.stderr,
                 flush=True,

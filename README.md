@@ -89,6 +89,9 @@ starts with `sandbox-` to switch all API calls to the sandbox hosts.
      Defaults to `uk-cs-mock uk-ob-all uk-oauth-all`, the same UK list as
      truelayer2actual.
    - **Days of history on first sync** (optional, default `7`).
+    - **Balance to report** (optional) — `available` (default, the spendable
+      figure your bank app shows) or `current` (settled only). Credit cards and
+      loans always use `current`, where `available` means remaining credit.
    - **Card account type** (optional) — `credit_card` (default), `checking`
      or `savings`. Set `checking` for debit cards whose balance is money you
      own rather than an amount owed.
@@ -111,12 +114,17 @@ derives the synthetic opening balance; a row it cannot convert to the account's
 currency contributes zero, the same way Actual leaves uncleared rows out of its
 balance.
 
-The plugin reports TrueLayer's `current` balance unchanged. `current` excludes
-pending transactions, and the visible pending rows no longer move Securo's
-opening balance: a pending £2 credit no longer creates a `-£2` opening-balance
-row. Credit cards and cards configured as `checking`/`savings` use the same
-rule. A manual edit to Securo's opening balance is overwritten on the next
-sync.
+By default the plugin reports TrueLayer's `available` balance for spendable
+accounts — the figure your bank app shows after pending purchases are deducted.
+Set **Balance to report** to `current` if you would rather use the settled-only
+figure. Credit cards and loans always use `current`: for a liability TrueLayer's
+`available` is the credit still left, not the amount owed.
+
+Visible pending rows are balance-neutral, so they no longer move Securo's
+synthetic opening balance on their own. The opening row is still computed by
+Securo as `reported balance − sum(imported rows)`; it fills the gap between the
+imported lookback window and the bank's real balance, and is overwritten on the
+next sync. A manual edit never sticks.
 
 Securo 0.21.0 does not support the `complete_feed` manifest flag, so this
 manifest deliberately omits it. This plugin no longer imports holds from the
@@ -152,17 +160,19 @@ does not match. `egress refused: ... is not allowed` in
 `docker compose logs plugins-egress` means the installed manifest is stale and
 must be updated.
 
-Version **1.1.3+** also logs one balance line per account on every sync:
+Version **1.1.3+** also logs one balance line per account on every sync. From
+**1.1.5** it shows both provider figures and which one was used:
 
 ```text
-truelayer_plugin.sync balance external_id=account:abc type=checking source=provider pending_total=0 posted_total=98.00 reported=98.00
+truelayer_plugin.sync balance external_id=account:abc type=checking source=provider field=available current=18.14 available=17.10 pending_total=0 posted_total=20.14 reported=17.10
 ```
 
-`source=provider` means TrueLayer supplied `current`; `source=transactions` means
-the balance was derived from the posted rows because neither `/balance` nor a
-running balance was available. `pending_total` is informational only: pending
-rows are visible but balance-neutral, so `reported` is TrueLayer's unadjusted
-`current` (or the posted total when there is no balance endpoint).
+`field=available` is the default for spendable accounts; `field=current` means
+the settled figure was selected (always the case for liabilities). `source=provider`
+means TrueLayer supplied the balance; `source=transactions` means it was derived
+from posted rows because neither `/balance` nor a running balance was available.
+`pending_total` is informational only: pending rows stay visible but are
+balance-neutral, so no hold is deducted a second time.
 
 ## Test locally before publishing
 
@@ -202,7 +212,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.1.4`).
+3. Publish a release (for example `v1.1.5`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 
