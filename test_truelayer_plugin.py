@@ -5,8 +5,10 @@ Run with: python3 -m unittest -v
 
 from __future__ import annotations
 
+import io
 import json
 import pathlib
+import sys
 import unittest
 import urllib.parse
 from decimal import Decimal
@@ -88,11 +90,39 @@ class TokenTests(unittest.TestCase):
     def test_oauth_exchange_invalid_grant_needs_auth(self):
         error = UpstreamError(400, "invalid_grant: code expired", "invalid_grant")
         with patch.object(plugin_module, "_request", side_effect=error):
-            with self.assertRaises(NeedsAuth):
+            with self.assertRaises(NeedsAuth) as raised:
                 plugin_module.plugin.oauth_exchange(
                     {"code": "old", "redirect_uri": "https://x/cb"},
                     context(config={"client_id": "app-123"}, secrets={"client_secret": "s"}),
                 )
+        # The actionable TrueLayer detail must survive the NeedsAuth mapping.
+        self.assertIn("HTTP 400", str(raised.exception))
+        self.assertIn("code expired", str(raised.exception))
+
+    def test_failures_are_logged_without_secrets(self):
+        stderr = io.StringIO()
+        ctx = context(
+            config={"client_id": "app-123"},
+            secrets={"client_secret": "super-secret-value"},
+        )
+        error = UpstreamError(
+            400, "invalid_client: super-secret-value was rejected", "invalid_client"
+        )
+        with patch.object(plugin_module, "_request", side_effect=error), patch.object(sys, "stderr", stderr):
+            with self.assertRaises(NeedsAuth):
+                plugin_module.plugin.oauth_exchange(
+                    {
+                        "code": "oauth-code-abcdef",
+                        "redirect_uri": "https://securo.example/plugins/oauth/callback",
+                    },
+                    ctx,
+                )
+        output = stderr.getvalue()
+        self.assertIn("truelayer_plugin.oauth_exchange failed", output)
+        self.assertIn("invalid_client", output)
+        self.assertIn("app-123", output)
+        self.assertNotIn("super-secret-value", output)
+        self.assertNotIn("oauth-code-abcdef", output)
 
     def test_expired_token_is_refreshed_and_returned_as_secrets(self):
         expired = context(

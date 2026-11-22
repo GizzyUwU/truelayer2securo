@@ -129,6 +129,32 @@ manually. Future Securo versions that support `complete_feed` can enable
 cancelled-hold expiry by declaring it, but the field must not be present for a
 0.21.0 install.
 
+## Troubleshooting OAuth 502
+
+Securo turns any exception from the plugin into `502 {"detail":"The plugin failed: ..."}`.
+A proxy in front of Securo may replace that JSON with its own 502 page, so the
+browser is not a reliable place to read the cause.
+
+Version **1.1.2+** prints every plugin failure to stderr with tokens, client
+secrets, OAuth codes and state values redacted. The plugin runner captures that
+stderr:
+
+```bash
+docker compose logs plugins-runner | grep truelayer_plugin
+```
+
+A failed token exchange now appears in the runner log with the real TrueLayer reason, for example:
+
+```text
+truelayer_plugin.oauth_exchange failed: NeedsAuth: TrueLayer needs a fresh sign-in; reconnect this bank in Securo. TrueLayer said: HTTP 400 invalid_client: Client authentication failed context={"client_id":"app-123","redirect_uri":"https://securo.example/plugins/oauth/callback"}
+```
+
+`invalid_client` means the client ID/secret or live/sandbox environment is
+wrong. `invalid_grant` means the code expired/was reused or the redirect URI
+does not match. `egress refused: ... is not allowed` in
+`docker compose logs plugins-egress` means the installed manifest is stale and
+must be updated.
+
 ## Test locally before publishing
 
 The plugin has no third-party dependencies, so a local catalog is enough:

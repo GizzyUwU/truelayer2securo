@@ -13,10 +13,14 @@ packages unless the manifest names a hashed lockfile.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
+import sys
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
@@ -58,6 +62,90 @@ class UpstreamError(Exception):
         self.status = status
         self.message = message
         self.code = code
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+_LOG_SAFE_KEYS = frozenset(
+    {"redirect_uri", "since", "last_sync_at", "client_id", "providers", "history_days", "card_kind"}
+)
+_LOG_SECRET_HINTS = ("secret", "token", "code", "state", "password", "key", "auth")
+
+
+def _sensitive_values(*sources: Any) -> list[str]:
+    """Values that must never appear in a plugin log line."""
+    values: set[str] = set()
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key, value in source.items():
+            name = str(key).lower()
+            if name in _LOG_SAFE_KEYS or value is None or isinstance(value, bool):
+                continue
+            if any(hint in name for hint in _LOG_SECRET_HINTS):
+                text = str(value)
+                if len(text) >= 4:
+                    values.add(text)
+    return sorted(values, key=len, reverse=True)
+
+
+def _mask(text: str, values: list[str]) -> str:
+    for value in values:
+        text = text.replace(value, "***")
+    return text
+
+
+def _clip_log(text: Any, limit: int = 500) -> str:
+    value = str(text)
+    return value if len(value) <= limit else f"{value[:limit]}..."
+
+
+def _log_failure(method: str, exc: BaseException, params: Any, context: Any) -> None:
+    """Print one safe error line to stderr; the runner logs it as plugin output."""
+    values = _sensitive_values(
+        params, getattr(context, "secrets", None), getattr(context, "config", None)
+    )
+    message = _mask(_clip_log(exc), values)
+    extra = ""
+    if isinstance(exc, UpstreamError):
+        extra = f" status={exc.status} upstream_code={_mask(str(exc.code or ''), values)}"
+
+    safe: dict[str, Any] = {}
+    config = getattr(context, "config", None)
+    if isinstance(config, Mapping) and config.get("client_id"):
+        safe["client_id"] = str(config["client_id"])
+    if isinstance(params, Mapping):
+        for key in ("redirect_uri", "since"):
+            if params.get(key):
+                safe[key] = str(params[key])
+
+    print(
+        f"truelayer_plugin.{method} failed: {type(exc).__name__}: {message}{extra} "
+        f"context={json.dumps(safe, sort_keys=True)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if not isinstance(exc, (NeedsAuth, RateLimited, UpstreamError, ValueError)):
+        print(_mask(traceback.format_exc(), values), file=sys.stderr, flush=True)
+
+
+def _logged(method: str):
+    """Log and re-raise, so Securo still gets its structured error reply."""
+
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(self, params: Any, context: Any):
+            try:
+                return func(self, params, context)
+            except Exception as exc:
+                _log_failure(method, exc, params, context)
+                raise
+
+        return wrapper
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +345,13 @@ def _post_token(client_id: str, form: dict[str, str]) -> dict[str, Any]:
         return _request(token_url(client_id), method="POST", form=form)
     except UpstreamError as exc:
         if exc.code == "invalid_grant" or exc.status in (401, 400) and exc.code == "invalid_client":
-            raise NeedsAuth("TrueLayer needs a fresh sign-in; reconnect this bank in Securo.") from None
+            # Keep TrueLayer's own reason: it is the difference between a wrong
+            # client secret, an expired code and a redirect-URI mismatch.
+            status = f"HTTP {exc.status} " if exc.status else ""
+            detail = f" TrueLayer said: {status}{exc.message}" if exc.message else ""
+            raise NeedsAuth(
+                f"TrueLayer needs a fresh sign-in; reconnect this bank in Securo.{detail}"
+            ) from None
         raise UpstreamError(exc.status, f"TrueLayer token request failed: {exc.message}", exc.code) from None
 
 
@@ -530,6 +624,7 @@ def _map_account(
 
 
 class Plugin:
+    @_logged("oauth_url")
     def oauth_url(self, params: dict[str, Any], context: Any) -> dict[str, str]:
         """Build the TrueLayer consent link for a new connection."""
         client_id = _client_id(context)
@@ -541,6 +636,7 @@ class Plugin:
             raise ValueError("Securo did not provide a redirect URI and state")
         return {"url": build_auth_url(client_id, redirect_uri, state, _providers(context))}
 
+    @_logged("oauth_exchange")
     def oauth_exchange(self, params: dict[str, Any], context: Any) -> dict[str, Any]:
         """Trade the callback code for tokens Securo keeps sealed."""
         client_id, client_secret = _client_id(context), _client_secret(context)
@@ -582,6 +678,7 @@ class Plugin:
             }
         }
 
+    @_logged("sync")
     def sync(self, params: dict[str, Any], context: Any) -> dict[str, Any]:
         """Fetch accounts, cards and their transactions for one connection."""
         client_id = _client_id(context)
