@@ -185,9 +185,13 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(second["external_id"], "account:a1:tl-2")
         self.assertEqual(second["type"], "credit")
         self.assertEqual(second["status"], "pending")
+        self.assertEqual(second["currency"], "XXX")
 
-        card = plugin_module.map_transactions([txns[1]], "card:c1", is_card=True)
+        card = plugin_module.map_transactions(
+            [txns[1]], "card:c1", is_card=True, account_currency="GBP"
+        )
         self.assertEqual(card[0]["type"], "debit")
+        self.assertEqual(card[0]["currency"], "XXX")
 
         # TrueLayer card refunds arrive negative; they are credits, not debits.
         refund = plugin_module.map_transactions(
@@ -258,7 +262,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": [card], "status": "success"}
             if "/transactions/pending" in url:
-                return {"results": [], "status": "success"}
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/accounts/acc-1/transactions" in url:
                 self.assertIn("from=2026-11-15", url)
                 return {"results": [account_txn], "status": "success"}
@@ -295,18 +299,19 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual(credit["external_id"], "card:card-1")
         self.assertEqual(credit["type"], "credit_card")
-        # `current` (50) excludes the pending 30 purchase; the reported
-        # balance includes it so Securo's opening balance stays unchanged.
-        self.assertEqual(credit["balance"], "80.00")
+        # TrueLayer's `current` (50) excludes the pending 30 purchase. The row
+        # stays visible, but is balance-neutral, so no adjustment is needed.
+        self.assertEqual(credit["balance"], "50.00")
         self.assertEqual(credit["masked_number"], "4242")
         self.assertEqual(credit["transactions"][0]["type"], "debit")
         self.assertEqual(credit["transactions"][0]["status"], "pending")
+        self.assertEqual(credit["transactions"][0]["currency"], "XXX")
 
         self.assertEqual(result["state"]["balances"]["account:acc-1"], "123.45")
         self.assertEqual(result["state"]["consent_status"], "active")
         self.assertNotIn("secrets", result)
 
-    def test_pending_feed_is_imported_without_shifting_opening_balance(self):
+    def test_pending_row_in_dated_feed_is_visible_but_balance_neutral(self):
         today = plugin_module.dt.date.today().isoformat()
         account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
         settled = {
@@ -315,6 +320,7 @@ class SyncTests(unittest.TestCase):
             "amount": -5.0,
             "transaction_type": "DEBIT",
             "description": "COFFEE",
+            "status": "booked",
         }
         hold = {
             "transaction_id": "hold-1",
@@ -322,6 +328,7 @@ class SyncTests(unittest.TestCase):
             "amount": 2.0,
             "transaction_type": "CREDIT",
             "description": "REFUND",
+            "status": "pending",
         }
 
         def fake_request(url, **kwargs):
@@ -329,10 +336,10 @@ class SyncTests(unittest.TestCase):
                 return {"results": [account]}
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
-            if "/accounts/acc-1/transactions/pending" in url:
-                return {"results": [hold]}
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/accounts/acc-1/transactions" in url:
-                return {"results": [settled]}
+                return {"results": [settled, hold]}
             if "/accounts/acc-1/balance" in url:
                 return {"results": [{"current": 100.0, "currency": "GBP"}]}
             if url.endswith("/data/v1/me"):
@@ -343,17 +350,21 @@ class SyncTests(unittest.TestCase):
             result = plugin_module.plugin.sync({}, valid_context())
 
         synced = result["data"]["accounts"][0]
-        self.assertEqual(synced["balance"], "102.00")
+        # TrueLayer's `current` is used unchanged; the hold does not move it.
+        self.assertEqual(synced["balance"], "100.00")
         transactions = {tx["external_id"]: tx for tx in synced["transactions"]}
         self.assertEqual(len(transactions), 2)
-        self.assertEqual(transactions["account:acc-1:hold-1"]["status"], "pending")
-        self.assertEqual(transactions["account:acc-1:hold-1"]["type"], "credit")
+        pending = transactions["account:acc-1:hold-1"]
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["type"], "credit")
+        self.assertEqual(pending["currency"], "XXX")
 
+        posted = [tx for tx in transactions.values() if tx["status"] == "posted"]
         signed = sum(
             (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
-            for tx in transactions.values()
+            for tx in posted
         )
-        # The opening balance Securo derives is unchanged by importing the hold.
+        # Securo's derived opening balance is unchanged by the visible hold.
         self.assertEqual(Decimal(synced["balance"]) - signed, Decimal("105.00"))
 
     def test_pending_row_in_dated_feed_is_marked_pending_once(self):
@@ -366,6 +377,7 @@ class SyncTests(unittest.TestCase):
             "amount": -2.0,
             "transaction_type": "DEBIT",
             "description": "CARD HOLD",
+            "status": "pending",
         }
 
         def fake_request(url, **kwargs):
@@ -373,8 +385,8 @@ class SyncTests(unittest.TestCase):
                 return {"results": [account]}
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
-            if "/accounts/acc-1/transactions/pending" in url:
-                return {"results": [row]}
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [row]}
             if "/accounts/acc-1/balance" in url:
@@ -389,10 +401,11 @@ class SyncTests(unittest.TestCase):
         transactions = result["data"]["accounts"][0]["transactions"]
         self.assertEqual(len(transactions), 1)
         self.assertEqual(transactions[0]["status"], "pending")
-        # -2 hold is not in `current`, so the reported balance includes it.
-        self.assertEqual(result["data"]["accounts"][0]["balance"], "48.00")
+        self.assertEqual(transactions[0]["currency"], "XXX")
+        # The -2 hold is not in `current`, and it no longer shifts the balance.
+        self.assertEqual(result["data"]["accounts"][0]["balance"], "50.00")
 
-    def test_unsupported_pending_feed_keeps_settled_transactions(self):
+    def test_settled_feed_is_kept_without_fetching_pending_transactions(self):
         today = plugin_module.dt.date.today().isoformat()
         account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
         settled = {
@@ -409,7 +422,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
             if "/transactions/pending" in url:
-                raise UpstreamError(501, "not supported", "endpoint_not_supported")
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [settled]}
             if "/accounts/acc-1/balance" in url:
@@ -426,7 +439,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(len(synced["transactions"]), 1)
         self.assertEqual(synced["transactions"][0]["status"], "posted")
 
-    def test_card_pending_purchases_and_refunds_adjust_debt(self):
+    def test_card_pending_rows_are_visible_but_do_not_change_debt(self):
         today = plugin_module.dt.date.today().isoformat()
         card = {"account_id": "card-1", "display_name": "Card", "currency": "GBP"}
 
@@ -435,23 +448,8 @@ class SyncTests(unittest.TestCase):
                 return {"results": []}
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
-            if "/cards/card-1/transactions/pending" in url:
-                return {
-                    "results": [
-                        {
-                            "transaction_id": "hold-buy",
-                            "timestamp": f"{today}T10:00:00Z",
-                            "amount": 20.0,
-                            "description": "PENDING SHOP",
-                        },
-                        {
-                            "transaction_id": "hold-refund",
-                            "timestamp": f"{today}T11:00:00Z",
-                            "amount": -5.0,
-                            "description": "PENDING REFUND",
-                        },
-                    ]
-                }
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/cards/card-1/transactions" in url:
                 return {
                     "results": [
@@ -460,7 +458,22 @@ class SyncTests(unittest.TestCase):
                             "timestamp": f"{today}T09:00:00Z",
                             "amount": 30.0,
                             "description": "POSTED SHOP",
-                        }
+                            "status": "booked",
+                        },
+                        {
+                            "transaction_id": "hold-buy",
+                            "timestamp": f"{today}T10:00:00Z",
+                            "amount": 20.0,
+                            "description": "PENDING SHOP",
+                            "status": "pending",
+                        },
+                        {
+                            "transaction_id": "hold-refund",
+                            "timestamp": f"{today}T11:00:00Z",
+                            "amount": -5.0,
+                            "description": "PENDING REFUND",
+                            "status": "pending",
+                        },
                     ]
                 }
             if "/cards/card-1/balance" in url:
@@ -473,22 +486,25 @@ class SyncTests(unittest.TestCase):
             result = plugin_module.plugin.sync({}, valid_context())
 
         synced = result["data"]["accounts"][0]
-        self.assertEqual(synced["balance"], "65.00")
+        self.assertEqual(synced["balance"], "50.00")
         by_id = {tx["external_id"]: tx for tx in synced["transactions"]}
         self.assertEqual(by_id["card:card-1:hold-buy"]["type"], "debit")
         self.assertEqual(by_id["card:card-1:hold-buy"]["status"], "pending")
+        self.assertEqual(by_id["card:card-1:hold-buy"]["currency"], "XXX")
         self.assertEqual(by_id["card:card-1:hold-refund"]["type"], "credit")
         self.assertEqual(by_id["card:card-1:hold-refund"]["status"], "pending")
+        self.assertEqual(by_id["card:card-1:hold-refund"]["currency"], "XXX")
 
+        posted = [tx for tx in by_id.values() if tx["status"] == "posted"]
         signed = sum(
             (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
-            for tx in by_id.values()
+            for tx in posted
         )
-        # The remaining -20 is the debt from before this 7-day window;
-        # importing the holds does not change it.
+        # The remaining -20 is the debt from before this window; holds do not
+        # move the provider's `current` figure or Securo's synthetic opening.
         self.assertEqual(-Decimal(synced["balance"]) - signed, Decimal("-20.00"))
 
-    def test_checking_card_pending_purchase_keeps_asset_opening_balance(self):
+    def test_checking_card_pending_purchase_is_balance_neutral(self):
         today = plugin_module.dt.date.today().isoformat()
         card = {"account_id": "card-1", "display_name": "Debit Card", "currency": "GBP"}
         hold = {
@@ -496,6 +512,7 @@ class SyncTests(unittest.TestCase):
             "timestamp": f"{today}T10:00:00Z",
             "amount": 20.0,
             "description": "PENDING SHOP",
+            "status": "pending",
         }
 
         def fake_request(url, **kwargs):
@@ -503,10 +520,10 @@ class SyncTests(unittest.TestCase):
                 return {"results": []}
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
-            if "/cards/card-1/transactions/pending" in url:
-                return {"results": [hold]}
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/cards/card-1/transactions" in url:
-                return {"results": []}
+                return {"results": [hold]}
             if "/cards/card-1/balance" in url:
                 return {"results": [{"current": 50.0, "currency": "GBP"}]}
             if url.endswith("/data/v1/me"):
@@ -520,16 +537,12 @@ class SyncTests(unittest.TestCase):
 
         synced = result["data"]["accounts"][0]
         self.assertEqual(synced["type"], "checking")
-        # A debit card's balance is money owned: a 20 purchase lowers it.
-        self.assertEqual(synced["balance"], "30.00")
+        self.assertEqual(synced["balance"], "50.00")
         self.assertEqual(synced["transactions"][0]["type"], "debit")
-        # The opening balance Securo derives stays at the pre-pending 50.
-        self.assertEqual(
-            Decimal(synced["balance"]) + Decimal(synced["transactions"][0]["amount"]),
-            Decimal("50.00"),
-        )
+        self.assertEqual(synced["transactions"][0]["status"], "pending")
+        self.assertEqual(synced["transactions"][0]["currency"], "XXX")
 
-    def test_missing_balance_keeps_opening_balance_for_account_hold(self):
+    def test_missing_balance_ignores_pending_row_when_deriving_balance(self):
         today = plugin_module.dt.date.today().isoformat()
         account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
         hold = {
@@ -538,6 +551,7 @@ class SyncTests(unittest.TestCase):
             "amount": 2.0,
             "transaction_type": "CREDIT",
             "description": "REFUND",
+            "status": "pending",
         }
 
         def fake_request(url, **kwargs):
@@ -545,10 +559,10 @@ class SyncTests(unittest.TestCase):
                 return {"results": [account]}
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
-            if "/accounts/acc-1/transactions/pending" in url:
-                return {"results": [hold]}
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/accounts/acc-1/transactions" in url:
-                return {"results": []}
+                return {"results": [hold]}
             if "/accounts/acc-1/balance" in url:
                 raise UpstreamError(404, "not found", "account_not_found")
             if url.endswith("/data/v1/me"):
@@ -560,15 +574,12 @@ class SyncTests(unittest.TestCase):
             result = plugin_module.plugin.sync({}, valid_context())
 
         synced = result["data"]["accounts"][0]
-        self.assertEqual(synced["balance"], "2.00")
-        signed = sum(
-            (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
-            for tx in synced["transactions"]
-        )
-        self.assertEqual(Decimal(synced["balance"]) - signed, Decimal("0.00"))
+        self.assertEqual(synced["balance"], "0.00")
+        self.assertEqual(synced["transactions"][0]["status"], "pending")
+        self.assertEqual(synced["transactions"][0]["currency"], "XXX")
         self.assertIn("source=transactions", stderr.getvalue())
 
-    def test_missing_balance_keeps_opening_balance_for_card_hold(self):
+    def test_missing_balance_ignores_pending_card_hold_when_deriving_balance(self):
         today = plugin_module.dt.date.today().isoformat()
         card = {"account_id": "card-1", "display_name": "Credit Card", "currency": "GBP"}
         hold = {
@@ -576,6 +587,7 @@ class SyncTests(unittest.TestCase):
             "timestamp": f"{today}T11:00:00Z",
             "amount": 2.0,
             "description": "PENDING SHOP",
+            "status": "pending",
         }
 
         def fake_request(url, **kwargs):
@@ -583,10 +595,10 @@ class SyncTests(unittest.TestCase):
                 return {"results": []}
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
-            if "/cards/card-1/transactions/pending" in url:
-                return {"results": [hold]}
+            if "/transactions/pending" in url:
+                raise AssertionError("the dedicated pending feed must not be fetched")
             if "/cards/card-1/transactions" in url:
-                return {"results": []}
+                return {"results": [hold]}
             if "/cards/card-1/balance" in url:
                 raise UpstreamError(404, "not found", "account_not_found")
             if url.endswith("/data/v1/me"):
@@ -598,14 +610,9 @@ class SyncTests(unittest.TestCase):
             result = plugin_module.plugin.sync({}, valid_context())
 
         synced = result["data"]["accounts"][0]
-        self.assertEqual(synced["balance"], "2.00")
-        signed = sum(
-            (Decimal(tx["amount"]) if tx["type"] == "credit" else -Decimal(tx["amount"]))
-            for tx in synced["transactions"]
-        )
-        # Liabilities are stored as positive debt; Securo negates it for the
-        # opening-balance sum, so a pending purchase still cancels out.
-        self.assertEqual(-Decimal(synced["balance"]) - signed, Decimal("0.00"))
+        self.assertEqual(synced["balance"], "0.00")
+        self.assertEqual(synced["transactions"][0]["currency"], "XXX")
+        self.assertIn("source=transactions", stderr.getvalue())
 
     def test_empty_response_does_not_look_like_closed_accounts(self):
         with patch.object(plugin_module, "_request", return_value={"results": []}):

@@ -21,7 +21,7 @@ synced records.
 | Accounts **and** cards | Both, as separate TrueLayer feeds; cards default to Securo `credit_card` accounts |
 | Stable `normalised_provider_transaction_id` for dedupe | Same, prefixed with the account ID to avoid cross-account collisions |
 | 7-day lookback so pending transactions settle | Securo's 14-day overlap is used; first sync defaults to 7 days |
-| Re-read pending transactions | Dedicated TrueLayer pending feed for accounts **and** cards, merged with the dated feed and marked `pending` |
+| Re-read pending transactions | Dated feed only, like truelayer2actual; provider-marked `pending` rows stay visible but are balance-neutral |
 | Payee from `merchant_name`, notes from `description` | Payee from `merchant_name`, description from `description`; classification becomes Securo's provider category |
 | Per-bank isolation; one dead bank doesn't stop the rest | One Securo plugin connection per bank, each with its own status and schedule |
 | Consent expiry / reauth prompts | 401/403 become `NeedsAuth`, shown as an expired bank connection with a reconnect action |
@@ -99,33 +99,30 @@ starts with `sandbox-` to switch all API calls to the sandbox hosts.
 
 ## Pending transactions and the opening balance
 
-The plugin (version **1.1.1+**) also reads TrueLayer's dedicated pending feed
-for both accounts and cards:
+TrueLayer's `/transactions` endpoint returns settled rows only; holds live on
+the separate `/transactions/pending` endpoint. truelayer2actual does not import
+that feed, and version **1.1.4+** of this plugin no longer does either. This is
+what keeps Securo's derived opening balance from absorbing a hold.
 
-- `GET /data/v1/accounts/{id}/transactions/pending`
-- `GET /data/v1/cards/{id}/transactions/pending`
+If a provider still returns a row marked `pending` in the dated feed, the row
+stays visible in Securo with its original amount and `status: pending`, but is
+given an unconvertible currency (`XXX`). Securo sums every imported row when it
+derives the synthetic opening balance; a row it cannot convert to the account's
+currency contributes zero, the same way Actual leaves uncleared rows out of its
+balance.
 
-Rows found there are marked `pending` in Securo, deduplicated by TrueLayer's
-stable transaction ID and merged with the dated transactions feed. A settled
-copy of the same hold is marked pending too, so it is not imported twice.
-Providers that answer `404`/`501` simply keep the settled feed; nothing fails.
-Securo's **Import pending** connection setting must stay enabled (it is on by
-default) for these rows to appear.
-
-TrueLayer's `current` balance excludes pending transactions, while Securo
-counts them when it derives its synthetic opening-balance transaction. The
-plugin therefore reports a balance that includes the signed pending total;
-Securo's derived opening balance stays at its pre-pending value instead of
-absorbing a hold (for example, a pending £2 credit no longer creates a `-£2`
-opening-balance row). Credit cards report positive debt, so the adjustment runs
-the other way; cards configured as `checking` or `savings` are adjusted as
-assets. A manual edit to Securo's opening balance is overwritten on the next
+The plugin reports TrueLayer's `current` balance unchanged. `current` excludes
+pending transactions, and the visible pending rows no longer move Securo's
+opening balance: a pending £2 credit no longer creates a `-£2` opening-balance
+row. Credit cards and cards configured as `checking`/`savings` use the same
+rule. A manual edit to Securo's opening balance is overwritten on the next
 sync.
 
 Securo 0.21.0 does not support the `complete_feed` manifest flag, so this
-manifest deliberately omits it. A hold that is cancelled at the provider
-rather than posted will therefore stay pending in 0.21.0 until removed
-manually. Future Securo versions that support `complete_feed` can enable
+manifest deliberately omits it. This plugin no longer imports holds from the
+dedicated pending feed, so it cannot leave a cancelled hold behind; a pending
+row supplied by the bank itself can still be removed manually if the bank
+cancels it. Future Securo versions that support `complete_feed` can enable
 cancelled-hold expiry by declaring it, but the field must not be present for a
 0.21.0 install.
 
@@ -158,14 +155,14 @@ must be updated.
 Version **1.1.3+** also logs one balance line per account on every sync:
 
 ```text
-truelayer_plugin.sync balance external_id=account:abc type=checking source=provider pending_total=-2.00 reported=98.00
+truelayer_plugin.sync balance external_id=account:abc type=checking source=provider pending_total=0 posted_total=98.00 reported=98.00
 ```
 
 `source=provider` means TrueLayer supplied `current`; `source=transactions` means
-the balance was derived from the imported rows because neither `/balance` nor a
-running balance was available. Either way the reported balance includes the
-signed pending total so Securo's synthetic opening-balance row does not absorb
-the holds.
+the balance was derived from the posted rows because neither `/balance` nor a
+running balance was available. `pending_total` is informational only: pending
+rows are visible but balance-neutral, so `reported` is TrueLayer's unadjusted
+`current` (or the posted total when there is no balance endpoint).
 
 ## Test locally before publishing
 
@@ -205,7 +202,7 @@ your own GitHub repository (the catalog requires them to match), then:
 
 1. Push to a public repository.
 2. Add the `securo-plugin` topic.
-3. Publish a release (for example `v1.1.3`).
+3. Publish a release (for example `v1.1.4`).
 
 The catalog picks it up on its next rebuild (about every 6 hours).
 
