@@ -461,6 +461,11 @@ def _currency(value: Any) -> str:
     return code if len(code) == 3 and code.isalpha() else "GBP"
 
 
+def _as_pending(transaction: dict[str, Any]) -> dict[str, Any]:
+    """TrueLayer's pending feed has no status field, but Securo needs one."""
+    return {**transaction, "status": "pending"}
+
+
 def _pending_currency(account_currency: Any) -> str:
     """A currency code Securo cannot convert to the account's currency."""
     return PENDING_FALLBACK_CURRENCY if _currency(account_currency) == PENDING_CURRENCY else PENDING_CURRENCY
@@ -759,17 +764,32 @@ class Plugin:
                 source_field = "available" if use_available else "current"
             currency_hint = _currency(record.get("currency") or (balance or {}).get("currency"))
 
-            # TrueLayer's dated endpoint returns settled rows only; holds live
-            # on the separate /transactions/pending endpoint. truelayer2actual
-            # never imports that feed, and Securo sums every imported row when
-            # deriving its synthetic opening balance, so importing holds would
-            # shift the opening even though TrueLayer's `current` excludes
-            # them. Any pending row a provider does include here stays visible
-            # but is made balance-neutral by map_transactions.
+            # TrueLayer's dated endpoint is settled-only for most providers;
+            # holds live on the separate /transactions/pending endpoint (which
+            # returns all current holds, not a date range). Fetch both so
+            # Securo shows pending + posted rows. 404/501 means the provider
+            # has no pending feed; keep the settled rows. Any pending row stays
+            # visible but is made balance-neutral by map_transactions.
+            pending = _fetch_collection(
+                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", access_token
+            )
             transactions = None
             if raw_transactions is not None:
+                feed = list(raw_transactions)
+                if pending:
+                    pending_ids = {
+                        _stable_external_id(item, external_id) for item in pending
+                    }
+                    pending_ids.discard(None)
+                    feed = [
+                        _as_pending(item)
+                        if _stable_external_id(item, external_id) in pending_ids
+                        else item
+                        for item in feed
+                    ]
+                    feed.extend(_as_pending(item) for item in pending)
                 transactions = map_transactions(
-                    raw_transactions,
+                    feed,
                     external_id,
                     is_card=is_card,
                     account_currency=currency_hint,

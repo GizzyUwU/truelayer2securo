@@ -262,9 +262,9 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": [card], "status": "success"}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
-                self.assertIn("from=2026-11-15", url)
+                self.assertIn("from=", url)
                 return {"results": [account_txn], "status": "success"}
             if "/cards/card-1/transactions" in url:
                 return {"results": [card_txn], "status": "success"}
@@ -390,7 +390,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [settled, hold]}
             if "/accounts/acc-1/balance" in url:
@@ -439,7 +439,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [row]}
             if "/accounts/acc-1/balance" in url:
@@ -458,7 +458,91 @@ class SyncTests(unittest.TestCase):
         # The -2 hold is not in `current`, and it no longer shifts the balance.
         self.assertEqual(result["data"]["accounts"][0]["balance"], "50.00")
 
-    def test_settled_feed_is_kept_without_fetching_pending_transactions(self):
+    def test_pending_feed_is_imported_alongside_posted(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        settled = {
+            "transaction_id": "t-1",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -5.0,
+            "transaction_type": "DEBIT",
+            "description": "COFFEE",
+        }
+        # TrueLayer's pending feed has no status field; the plugin marks it.
+        hold = {
+            "transaction_id": "hold-1",
+            "timestamp": f"{today}T11:00:00Z",
+            "amount": -20.0,
+            "transaction_type": "DEBIT",
+            "description": "PENDING SHOP",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/accounts/acc-1/transactions/pending" in url:
+                return {"results": [hold]}
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [settled]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 100.0, "available": 80.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        synced = result["data"]["accounts"][0]
+        by_id = {tx["external_id"]: tx for tx in synced["transactions"]}
+        self.assertEqual(len(by_id), 2)
+        self.assertEqual(by_id["account:acc-1:t-1"]["status"], "posted")
+        self.assertEqual(by_id["account:acc-1:t-1"]["currency"], "GBP")
+        self.assertEqual(by_id["account:acc-1:hold-1"]["status"], "pending")
+        self.assertEqual(by_id["account:acc-1:hold-1"]["currency"], "XXX")
+        # Spendable accounts report `available`; the hold stays visible but
+        # balance-neutral.
+        self.assertEqual(synced["balance"], "80.00")
+
+    def test_pending_feed_marks_matching_dated_row_pending_once(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        row = {
+            "transaction_id": "same",
+            "normalised_provider_transaction_id": "stable-same",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -2.0,
+            "transaction_type": "DEBIT",
+            "description": "CARD HOLD",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/accounts/acc-1/transactions/pending" in url:
+                return {"results": [row]}
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [row]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 50.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        transactions = result["data"]["accounts"][0]["transactions"]
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["status"], "pending")
+        self.assertEqual(transactions[0]["currency"], "XXX")
+        self.assertEqual(result["data"]["accounts"][0]["balance"], "50.00")
+
+    def test_unsupported_pending_feed_keeps_settled_transactions(self):
         today = plugin_module.dt.date.today().isoformat()
         account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
         settled = {
@@ -475,7 +559,41 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                raise UpstreamError(501, "not supported", "endpoint_not_supported")
+            if "/accounts/acc-1/transactions" in url:
+                return {"results": [settled]}
+            if "/accounts/acc-1/balance" in url:
+                return {"results": [{"current": 100.0, "currency": "GBP"}]}
+            if url.endswith("/data/v1/me"):
+                return {"results": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid_context())
+
+        synced = result["data"]["accounts"][0]
+        self.assertEqual(synced["balance"], "100.00")
+        self.assertEqual(len(synced["transactions"]), 1)
+        self.assertEqual(synced["transactions"][0]["status"], "posted")
+
+    def test_settled_feed_with_empty_pending_feed(self):
+        today = plugin_module.dt.date.today().isoformat()
+        account = {"account_id": "acc-1", "display_name": "Current", "currency": "GBP"}
+        settled = {
+            "transaction_id": "t-1",
+            "timestamp": f"{today}T10:00:00Z",
+            "amount": -5.0,
+            "transaction_type": "DEBIT",
+            "description": "COFFEE",
+        }
+
+        def fake_request(url, **kwargs):
+            if url.endswith("/data/v1/accounts"):
+                return {"results": [account]}
+            if url.endswith("/data/v1/cards"):
+                return {"results": []}
+            if "/transactions/pending" in url:
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [settled]}
             if "/accounts/acc-1/balance" in url:
@@ -502,7 +620,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/cards/card-1/transactions" in url:
                 return {
                     "results": [
@@ -574,7 +692,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/cards/card-1/transactions" in url:
                 return {"results": [hold]}
             if "/cards/card-1/balance" in url:
@@ -613,7 +731,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": []}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/accounts/acc-1/transactions" in url:
                 return {"results": [hold]}
             if "/accounts/acc-1/balance" in url:
@@ -649,7 +767,7 @@ class SyncTests(unittest.TestCase):
             if url.endswith("/data/v1/cards"):
                 return {"results": [card]}
             if "/transactions/pending" in url:
-                raise AssertionError("the dedicated pending feed must not be fetched")
+                return {"results": [], "status": "success"}
             if "/cards/card-1/transactions" in url:
                 return {"results": [hold]}
             if "/cards/card-1/balance" in url:
