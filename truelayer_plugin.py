@@ -239,11 +239,24 @@ def _request(
     return payload
 
 
-def _get_json(url: str, token: str, *, allow_missing: bool = False) -> dict[str, Any] | None:
-    """A data read, with the error mapping the bank connection relies on."""
+def _get_json(
+    url: str, token: str | _AccessToken, *, allow_missing: bool = False
+) -> dict[str, Any] | None:
+    """A data read, with the error mapping the bank connection relies on.
+
+    A 401 is worth one forced refresh: the stored expiry can be wrong, or
+    TrueLayer can retire an access token early. Only a 401 that survives the
+    retry means the person has to sign in again.
+    """
+    value = token.value if isinstance(token, _AccessToken) else token
     try:
-        return _request(url, token=token)
+        return _request(url, token=value)
     except UpstreamError as exc:
+        if exc.status == 401 and isinstance(token, _AccessToken) and token.refresh():
+            try:
+                return _request(url, token=token.value)
+            except UpstreamError as retried:
+                exc = retried
         if allow_missing and exc.status in (404, 501):
             return None
         if exc.status in (401, 403):
@@ -270,7 +283,7 @@ def _next_url(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _fetch_collection(url: str, token: str) -> list[dict[str, Any]] | None:
+def _fetch_collection(url: str, token: str | _AccessToken) -> list[dict[str, Any]] | None:
     """Every result across TrueLayer's pages, or None when the feed is unsupported."""
     results: list[dict[str, Any]] = []
     pages = 0
@@ -286,7 +299,7 @@ def _fetch_collection(url: str, token: str) -> list[dict[str, Any]] | None:
     return results
 
 
-def _fetch_balance(url: str, token: str) -> dict[str, Any] | None:
+def _fetch_balance(url: str, token: str | _AccessToken) -> dict[str, Any] | None:
     payload = _get_json(url, token, allow_missing=True)
     if not payload:
         return None
@@ -383,24 +396,8 @@ def _needs_refresh(expires_at: Any, now: dt.datetime | None = None) -> bool:
     return (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(seconds=TOKEN_BUFFER_SECONDS) >= expiry
 
 
-def _access_token(context: Any) -> tuple[str, dict[str, str]]:
-    """A usable access token and any rotated secrets Securo must store."""
-    client_id = _client_id(context)
-    if not client_id:
-        raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
-
-    access = str(context.secrets.get("access_token") or "")
-    refresh = str(context.secrets.get("refresh_token") or "")
-    if not access or not refresh:
-        raise NeedsAuth("This TrueLayer connection hasn't finished signing in; reconnect it.")
-
-    if not _needs_refresh(context.secrets.get("expires_at")):
-        return access, {}
-
-    client_secret = _client_secret(context)
-    if not client_secret:
-        raise NeedsAuth("Add your TrueLayer client secret in the connection settings.")
-
+def _refresh_token(client_id: str, client_secret: str, refresh: str) -> tuple[str, dict[str, str]]:
+    """Exchange a refresh token for a new access token and the secrets to keep."""
     data = _post_token(
         client_id,
         {
@@ -426,6 +423,53 @@ def _access_token(context: Any) -> tuple[str, dict[str, str]]:
         "expires_at": expires_at,
     }
     return new_access, patch
+
+
+def _access_token(context: Any) -> tuple[str, dict[str, str]]:
+    """A usable access token and any rotated secrets Securo must store."""
+    client_id = _client_id(context)
+    if not client_id:
+        raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
+
+    access = str(context.secrets.get("access_token") or "")
+    refresh = str(context.secrets.get("refresh_token") or "")
+    if not access or not refresh:
+        raise NeedsAuth("This TrueLayer connection hasn't finished signing in; reconnect it.")
+
+    if not _needs_refresh(context.secrets.get("expires_at")):
+        return access, {}
+
+    client_secret = _client_secret(context)
+    if not client_secret:
+        raise NeedsAuth("Add your TrueLayer client secret in the connection settings.")
+
+    return _refresh_token(client_id, client_secret, refresh)
+
+
+class _AccessToken:
+    """One sync's token, with a single forced refresh if TrueLayer rejects it."""
+
+    def __init__(self, value: str, patch: dict[str, str], context: Any) -> None:
+        self.value = value
+        self.patch = patch
+        self.context = context
+        self.refreshed = False
+
+    def refresh(self) -> bool:
+        """Refresh once, reusing any rotation already seen in this sync."""
+        if self.refreshed:
+            return False
+        self.refreshed = True
+        secrets = dict(self.context.secrets)
+        secrets.update(self.patch)
+        refresh = str(secrets.get("refresh_token") or "")
+        client_secret = _client_secret(self.context)
+        if not refresh or not client_secret:
+            return False
+        value, patch = _refresh_token(_client_id(self.context), client_secret, refresh)
+        self.value = value
+        self.patch.update(patch)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +755,8 @@ class Plugin:
         if not client_id:
             raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
 
-        access_token, token_patch = _access_token(context)
+        access, token_patch = _access_token(context)
+        token = _AccessToken(access, token_patch, context)
         api = api_base_url(client_id)
         state = dict(params.get("state") or {})
         balances: dict[str, str] = {
@@ -724,9 +769,9 @@ class Plugin:
         # Account and card feeds are separate at TrueLayer. Fetch once per
         # account, reusing the result for all of Securo's downstream matching.
         sources: list[tuple[dict[str, Any], bool, str]] = []
-        for record in _fetch_collection(f"{api}/data/v1/accounts", access_token) or []:
+        for record in _fetch_collection(f"{api}/data/v1/accounts", token) or []:
             sources.append((record, False, f"account:{record.get('account_id')}"))
-        for record in _fetch_collection(f"{api}/data/v1/cards", access_token) or []:
+        for record in _fetch_collection(f"{api}/data/v1/cards", token) or []:
             sources.append((record, True, f"card:{record.get('account_id')}"))
 
         accounts: list[dict[str, Any]] = []
@@ -742,9 +787,9 @@ class Plugin:
             account_type = card_kind if is_card else _account_type(record)
             raw_transactions = _fetch_collection(
                 f"{api}/data/v1/{kind}/{quoted}/transactions?from={since}&to={today.isoformat()}",
-                access_token,
+                token,
             )
-            balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", access_token)
+            balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", token)
             provider_current = balance.get("current") if balance else None
             available = balance.get("available") if balance else None
             # `available` is the spendable figure the bank app shows after
@@ -771,7 +816,7 @@ class Plugin:
             # has no pending feed; keep the settled rows. Any pending row stays
             # visible but is made balance-neutral by map_transactions.
             pending = _fetch_collection(
-                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", access_token
+                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", token
             )
             transactions = None
             if raw_transactions is not None:
@@ -846,7 +891,7 @@ class Plugin:
         # Connection metadata is best effort: a /me failure never costs us a
         # successful account fetch (and never loses a rotated refresh token).
         try:
-            me_payload = _fetch_balance(f"{api}/data/v1/me", access_token)
+            me_payload = _fetch_balance(f"{api}/data/v1/me", token)
             if me_payload:
                 if me_payload.get("consent_status") is not None:
                     state["consent_status"] = str(me_payload.get("consent_status"))
@@ -858,8 +903,8 @@ class Plugin:
         state["balances"] = balances
         state["last_sync"] = today.isoformat()
         result: dict[str, Any] = {"state": state}
-        if token_patch:
-            result["secrets"] = token_patch
+        if token.patch:
+            result["secrets"] = token.patch
         # An empty TrueLayer response is treated as "nothing fetched", so a
         # transient outage cannot look like the person closed every account.
         result["data"] = {"contract": 1, "accounts": accounts} if accounts else None

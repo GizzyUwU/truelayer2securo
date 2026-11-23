@@ -801,6 +801,87 @@ class SyncTests(unittest.TestCase):
                 plugin_module.plugin.sync({}, ctx)
 
 
+class TokenRecoveryTests(unittest.TestCase):
+    """A 401 is recoverable while the refresh token still works."""
+
+    def _stale_context(self):
+        return context(
+            config={"client_id": "app-123"},
+            secrets={
+                "client_secret": "secret-1",
+                "access_token": "stale-access",
+                "refresh_token": "refresh-1",
+                # The stored expiry lies: TrueLayer retired the token early.
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            },
+        )
+
+    def test_rejected_token_is_refreshed_and_retried(self):
+        valid = ["fresh-access"]
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append(url)
+            if "/connect/token" in url:
+                return {"access_token": "fresh-access", "refresh_token": "fresh-refresh", "expires_in": 3600}
+            if kwargs.get("token") != valid[0]:
+                raise UpstreamError(401, "access token expired", "access_token_expired")
+            return {"results": [], "status": "success"}
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, self._stale_context())
+
+        self.assertEqual(result["secrets"]["access_token"], "fresh-access")
+        self.assertEqual(result["secrets"]["refresh_token"], "fresh-refresh")
+        self.assertEqual(sum("/connect/token" in url for url in calls), 1)
+        self.assertIsNone(result["data"])
+
+    def test_next_sync_uses_the_rotated_token_without_refreshing(self):
+        valid = ["fresh-access"]
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append(url)
+            if "/connect/token" in url:
+                return {"access_token": "fresh-access", "expires_in": 3600}
+            if kwargs.get("token") != valid[0]:
+                raise UpstreamError(401, "access token expired", "access_token_expired")
+            return {"results": [], "status": "success"}
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            first = plugin_module.plugin.sync({}, self._stale_context())
+            # What Securo stores: the original secrets merged with the patch.
+            stored = self._stale_context().secrets | first["secrets"]
+            second = plugin_module.plugin.sync({}, context(config={"client_id": "app-123"}, secrets=stored))
+
+        self.assertEqual(sum("/connect/token" in url for url in calls), 1)
+        self.assertNotIn("secrets", second)
+
+    def test_token_rejected_again_after_refresh_needs_auth(self):
+        def fake_request(url, **kwargs):
+            if "/connect/token" in url:
+                return {"access_token": "fresh-access", "expires_in": 3600}
+            raise UpstreamError(401, "access token expired", "access_token_expired")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            with self.assertRaises(NeedsAuth) as raised:
+                plugin_module.plugin.sync({}, self._stale_context())
+        self.assertIn("rejected the access token", str(raised.exception))
+
+    def test_expired_consent_is_not_refreshed(self):
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append(url)
+            raise UpstreamError(403, "consent expired", "consent_expired")
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            with self.assertRaises(NeedsAuth) as raised:
+                plugin_module.plugin.sync({}, self._stale_context())
+        self.assertIn("consent has expired", str(raised.exception))
+        self.assertFalse(any("/connect/token" in url for url in calls))
+
+
 class ManifestTests(unittest.TestCase):
     def test_manifest_matches_plugin_and_contract(self):
         root = pathlib.Path(__file__).parent

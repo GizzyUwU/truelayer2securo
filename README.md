@@ -162,6 +162,12 @@ does not match. `egress refused: ... is not allowed` in
 `docker compose logs plugins-egress` means the installed manifest is stale and
 must be updated.
 
+From **1.2.1** a `401` on a data read triggers one forced token refresh and a
+retry, so an access token retired early by TrueLayer does not mark the bank as
+expired while the refresh token is still good. Only a `401` that survives that
+retry (or a `403`) needs a reconnect; the rotated tokens are saved with the
+sync.
+
 Version **1.1.3+** also logs one balance line per account on every sync. From
 **1.1.5** it shows both provider figures and which one was used:
 
