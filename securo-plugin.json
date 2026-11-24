@@ -25,6 +25,10 @@
     {
       "host": "api.truelayer-sandbox.com",
       "purpose": "Same data reads for sandbox apps."
+    },
+    {
+      "host": "github.com",
+      "purpose": "Get list of random residential ips."
     }
   ],
   "contributes": {
