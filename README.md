@@ -96,6 +96,10 @@ starts with `sandbox-` to switch all API calls to the sandbox hosts.
    - **Card account type** (optional) — `credit_card` (default), `checking`
      or `savings`. Set `checking` for debit cards whose balance is money you
      own rather than an amount owed.
+   - **Your real public IP for X-PSU-IP** (optional) — set your genuine
+     address. If it is unset, sync picks a random address from a bundled
+     snapshot of UK ISP ranges; this needs no network call, so a sync never
+     waits on a dataset download.
 4. Sign in at the bank. Securo creates the bank connection and lists its
    accounts; the first sync runs immediately, then every 6 hours.
 5. **Sync now** works from the connection card. Reconnect after consent

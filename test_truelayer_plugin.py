@@ -6,6 +6,7 @@ Run with: python3 -m unittest -v
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import pathlib
 import sys
@@ -1049,6 +1050,29 @@ class TokenRecoveryTests(unittest.TestCase):
                 plugin_module.plugin.sync({}, self._context())
         self.assertIn("consent has expired", str(raised.exception))
         self.assertEqual(sum("/connect/token" in url for url in calls), 1)
+
+
+class RandomGbIpTests(unittest.TestCase):
+    def test_bundled_ranges_decode_to_valid_ipv4_networks(self):
+        ranges = plugin_module._gb_isp_ranges()
+        self.assertGreater(len(ranges), 1000)
+        for start, size in ranges:
+            self.assertTrue(0 <= start < 2**32)
+            self.assertGreaterEqual(size, 256)
+            self.assertLessEqual(start + size, 2**32)
+
+    def test_random_ip_is_inside_a_bundled_range(self):
+        ranges = plugin_module._gb_isp_ranges()
+        for _ in range(200):
+            address = int(ipaddress.IPv4Address(plugin_module.random_gb_isp_ip()))
+            self.assertTrue(
+                any(start <= address < start + size for start, size in ranges)
+            )
+
+    def test_random_ip_does_not_touch_the_network(self):
+        with patch.object(plugin_module.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            for _ in range(10):
+                ipaddress.IPv4Address(plugin_module.random_gb_isp_ip())
 
 
 class ManifestTests(unittest.TestCase):
