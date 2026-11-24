@@ -68,6 +68,89 @@ class AuthUrlTests(unittest.TestCase):
         self.assertTrue(result["url"].startswith("https://auth.truelayer.com/"))
         self.assertIn("providers=uk-ob-all", result["url"])
 
+    def test_build_reauth_url_posts_truelayer_reauthuri(self):
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append((url, kwargs))
+            return {"result": "https://auth.truelayer.com/reauth?x=1", "success": True}
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            url = plugin_module.build_reauth_url(
+                "app-123", "refresh-1", "https://securo.example/plugins/oauth/callback", "s1"
+            )
+
+        self.assertEqual(url, "https://auth.truelayer.com/reauth?x=1")
+        self.assertEqual(len(calls), 1)
+        request_url, request = calls[0]
+        self.assertEqual(request_url, "https://auth.truelayer.com/v1/reauthuri")
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(
+            request["json_body"],
+            {
+                "response_type": "code",
+                "refresh_token": "refresh-1",
+                "redirect_uri": "https://securo.example/plugins/oauth/callback",
+                "state": "s1",
+            },
+        )
+
+    def test_oauth_url_uses_reauth_link_for_existing_connection(self):
+        params = {"redirect_uri": "https://securo.example/plugins/oauth/callback", "state": "s1"}
+        ctx = context(
+            config={"client_id": "app-123"},
+            secrets={"refresh_token": "refresh-1"},
+        )
+        with (
+            patch.object(plugin_module, "build_reauth_url", return_value="https://auth.truelayer.com/reauth") as reauth,
+            patch.object(plugin_module, "build_auth_url") as full,
+        ):
+            result = plugin_module.plugin.oauth_url(params, ctx)
+
+        self.assertEqual(result, {"url": "https://auth.truelayer.com/reauth"})
+        reauth.assert_called_once_with("app-123", "refresh-1", params["redirect_uri"], "s1")
+        full.assert_not_called()
+
+    def test_oauth_url_falls_back_to_full_auth_when_reauth_unavailable(self):
+        params = {"redirect_uri": "https://securo.example/plugins/oauth/callback", "state": "s1"}
+        ctx = context(
+            config={"client_id": "app-123"},
+            secrets={"refresh_token": "refresh-1"},
+        )
+        for status in (400, 401, 404):
+            with self.subTest(status=status):
+                with (
+                    patch.object(plugin_module, "build_reauth_url", side_effect=UpstreamError(status, "no reauth")),
+                    patch.object(plugin_module, "build_auth_url", return_value="https://auth.truelayer.com/full") as full,
+                ):
+                    result = plugin_module.plugin.oauth_url(params, ctx)
+                self.assertEqual(result, {"url": "https://auth.truelayer.com/full"})
+                full.assert_called_once_with(
+                    "app-123", params["redirect_uri"], "s1", plugin_module.DEFAULT_PROVIDERS
+                )
+
+    def test_oauth_url_does_not_ask_for_reauth_on_fresh_connection(self):
+        params = {"redirect_uri": "https://securo.example/plugins/oauth/callback", "state": "s1"}
+        with (
+            patch.object(plugin_module, "build_reauth_url") as reauth,
+            patch.object(plugin_module, "build_auth_url", return_value="https://auth.truelayer.com/full"),
+        ):
+            result = plugin_module.plugin.oauth_url(params, context(config={"client_id": "app-123"}))
+
+        self.assertEqual(result, {"url": "https://auth.truelayer.com/full"})
+        reauth.assert_not_called()
+
+    def test_oauth_url_does_not_hide_unexpected_reauth_errors(self):
+        params = {"redirect_uri": "https://securo.example/plugins/oauth/callback", "state": "s1"}
+        ctx = context(config={"client_id": "app-123"}, secrets={"refresh_token": "refresh-1"})
+        with (
+            patch.object(plugin_module, "build_reauth_url", side_effect=UpstreamError(500, "server error")),
+            patch.object(plugin_module, "build_auth_url") as full,
+        ):
+            with self.assertRaises(UpstreamError):
+                plugin_module.plugin.oauth_url(params, ctx)
+        full.assert_not_called()
+
 
 class TokenTests(unittest.TestCase):
     def test_oauth_exchange_keeps_tokens(self):
@@ -221,6 +304,13 @@ class MappingTests(unittest.TestCase):
 
 
 class SyncTests(unittest.TestCase):
+    def setUp(self):
+        # Sync now always mints a token at the start; these tests exercise the
+        # mapping/pipeline, so keep the HTTP fakes focused on the data calls.
+        refresh = patch.object(plugin_module, "_access_token", return_value=("access-1", {}))
+        refresh.start()
+        self.addCleanup(refresh.stop)
+
     def test_sync_maps_accounts_cards_balances_and_state(self):
         account = {
             "account_id": "acc-1",
@@ -802,84 +892,81 @@ class SyncTests(unittest.TestCase):
 
 
 class TokenRecoveryTests(unittest.TestCase):
-    """A 401 is recoverable while the refresh token still works."""
+    """Every sync mints a token; a rejected one must not force a reconnect."""
 
-    def _stale_context(self):
+    def _context(self):
         return context(
             config={"client_id": "app-123"},
             secrets={
                 "client_secret": "secret-1",
+                # The stored token and expiry are deliberately stale/wrong.
                 "access_token": "stale-access",
                 "refresh_token": "refresh-1",
-                # The stored expiry lies: TrueLayer retired the token early.
                 "expires_at": "2099-01-01T00:00:00+00:00",
             },
         )
 
-    def test_rejected_token_is_refreshed_and_retried(self):
-        valid = ["fresh-access"]
+    def test_stored_access_token_is_never_used(self):
+        used = []
+
+        def fake_request(url, **kwargs):
+            if "/connect/token" in url:
+                return {"access_token": "minted-access", "expires_in": 3600}
+            used.append(kwargs.get("token"))
+            return {"results": [], "status": "success"}
+
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, self._context())
+
+        self.assertEqual(used, ["minted-access"] * 3)
+        self.assertEqual(result["secrets"]["access_token"], "minted-access")
+
+    def test_rejected_minted_token_is_refreshed_and_retried(self):
         calls = []
 
         def fake_request(url, **kwargs):
             calls.append(url)
             if "/connect/token" in url:
-                return {"access_token": "fresh-access", "refresh_token": "fresh-refresh", "expires_in": 3600}
-            if kwargs.get("token") != valid[0]:
+                token = "minted-access" if sum("/connect/token" in u for u in calls) == 1 else "second-access"
+                return {"access_token": token, "refresh_token": "fresh-refresh", "expires_in": 3600}
+            if kwargs.get("token") != "second-access":
                 raise UpstreamError(401, "access token expired", "access_token_expired")
             return {"results": [], "status": "success"}
 
         with patch.object(plugin_module, "_request", side_effect=fake_request):
-            result = plugin_module.plugin.sync({}, self._stale_context())
+            result = plugin_module.plugin.sync({}, self._context())
 
-        self.assertEqual(result["secrets"]["access_token"], "fresh-access")
+        self.assertEqual(result["secrets"]["access_token"], "second-access")
         self.assertEqual(result["secrets"]["refresh_token"], "fresh-refresh")
-        self.assertEqual(sum("/connect/token" in url for url in calls), 1)
+        self.assertEqual(sum("/connect/token" in url for url in calls), 2)
         self.assertIsNone(result["data"])
 
-    def test_next_sync_uses_the_rotated_token_without_refreshing(self):
-        valid = ["fresh-access"]
-        calls = []
-
-        def fake_request(url, **kwargs):
-            calls.append(url)
-            if "/connect/token" in url:
-                return {"access_token": "fresh-access", "expires_in": 3600}
-            if kwargs.get("token") != valid[0]:
-                raise UpstreamError(401, "access token expired", "access_token_expired")
-            return {"results": [], "status": "success"}
-
-        with patch.object(plugin_module, "_request", side_effect=fake_request):
-            first = plugin_module.plugin.sync({}, self._stale_context())
-            # What Securo stores: the original secrets merged with the patch.
-            stored = self._stale_context().secrets | first["secrets"]
-            second = plugin_module.plugin.sync({}, context(config={"client_id": "app-123"}, secrets=stored))
-
-        self.assertEqual(sum("/connect/token" in url for url in calls), 1)
-        self.assertNotIn("secrets", second)
-
-    def test_token_rejected_again_after_refresh_needs_auth(self):
+    def test_token_still_rejected_after_retry_is_retryable_not_needs_auth(self):
         def fake_request(url, **kwargs):
             if "/connect/token" in url:
-                return {"access_token": "fresh-access", "expires_in": 3600}
+                return {"access_token": "minted-access", "expires_in": 3600}
             raise UpstreamError(401, "access token expired", "access_token_expired")
 
         with patch.object(plugin_module, "_request", side_effect=fake_request):
-            with self.assertRaises(NeedsAuth) as raised:
-                plugin_module.plugin.sync({}, self._stale_context())
-        self.assertIn("rejected the access token", str(raised.exception))
+            with self.assertRaises(UpstreamError) as raised:
+                plugin_module.plugin.sync({}, self._context())
+        self.assertEqual(raised.exception.status, 401)
+        self.assertIn("retry", str(raised.exception))
 
-    def test_expired_consent_is_not_refreshed(self):
+    def test_expired_consent_still_needs_auth(self):
         calls = []
 
         def fake_request(url, **kwargs):
             calls.append(url)
+            if "/connect/token" in url:
+                return {"access_token": "minted-access", "expires_in": 3600}
             raise UpstreamError(403, "consent expired", "consent_expired")
 
         with patch.object(plugin_module, "_request", side_effect=fake_request):
             with self.assertRaises(NeedsAuth) as raised:
-                plugin_module.plugin.sync({}, self._stale_context())
+                plugin_module.plugin.sync({}, self._context())
         self.assertIn("consent has expired", str(raised.exception))
-        self.assertFalse(any("/connect/token" in url for url in calls))
+        self.assertEqual(sum("/connect/token" in url for url in calls), 1)
 
 
 class ManifestTests(unittest.TestCase):

@@ -29,7 +29,6 @@ DEFAULT_PROVIDERS = "uk-cs-mock uk-ob-all uk-oauth-all"
 DEFAULT_HISTORY_DAYS = 7
 MIN_HISTORY_DAYS = 1
 MAX_HISTORY_DAYS = 365
-TOKEN_BUFFER_SECONDS = 60
 HTTP_TIMEOUT_SECONDS = 15
 MAX_PAGES = 50
 CENT = Decimal("0.01")
@@ -209,6 +208,7 @@ def _request(
     *,
     method: str = "GET",
     form: dict[str, str] | None = None,
+    json_body: dict[str, str] | None = None,
     token: str | None = None,
 ) -> dict[str, Any]:
     """One JSON request. Raises UpstreamError with a compact, safe message."""
@@ -217,6 +217,9 @@ def _request(
     if form is not None:
         data = urllib.parse.urlencode(form).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -244,9 +247,9 @@ def _get_json(
 ) -> dict[str, Any] | None:
     """A data read, with the error mapping the bank connection relies on.
 
-    A 401 is worth one forced refresh: the stored expiry can be wrong, or
-    TrueLayer can retire an access token early. Only a 401 that survives the
-    retry means the person has to sign in again.
+    A 401 gets one forced refresh and retry. If the freshly minted token is
+    still rejected, this is a retryable upstream error — not a reason to make
+    the person reconnect. Only a 403 (consent gone) needs a new sign-in.
     """
     value = token.value if isinstance(token, _AccessToken) else token
     try:
@@ -259,9 +262,15 @@ def _get_json(
                 exc = retried
         if allow_missing and exc.status in (404, 501):
             return None
-        if exc.status in (401, 403):
-            detail = "TrueLayer rejected the access token" if exc.status == 401 else "TrueLayer consent has expired"
-            raise NeedsAuth(f"{detail}; reconnect this bank in Securo.") from None
+        if exc.status == 401:
+            path = urllib.parse.urlsplit(url).path
+            raise UpstreamError(
+                401,
+                f"TrueLayer rejected the access token on {path}; Securo will retry next sync",
+                exc.code,
+            ) from None
+        if exc.status == 403:
+            raise NeedsAuth("TrueLayer consent has expired; reconnect this bank in Securo.") from None
         if exc.status == 429:
             raise RateLimited("TrueLayer rate-limited this request; Securo will retry later.") from None
         raise
@@ -364,6 +373,29 @@ def build_auth_url(client_id: str, redirect_uri: str, state: str, providers: str
     return f"{auth_base_url(client_id)}/?{urllib.parse.urlencode(params)}"
 
 
+def build_reauth_url(client_id: str, refresh_token: str, redirect_uri: str, state: str) -> str:
+    """TrueLayer's lightweight re-consent link for an existing connection.
+
+    Kept as a fallback for when a real consent expiry needs a person: it reuses
+    the existing TrueLayer connection instead of creating a new one. Nothing
+    calls it on the normal sync path.
+    """
+    data = _request(
+        f"{auth_base_url(client_id)}/v1/reauthuri",
+        method="POST",
+        json_body={
+            "response_type": "code",
+            "refresh_token": refresh_token,
+            "redirect_uri": redirect_uri,
+            "state": state,
+        },
+    )
+    url = data.get("result")
+    if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != "https":
+        raise UpstreamError(None, "TrueLayer returned no re-auth URL")
+    return url
+
+
 def _post_token(client_id: str, form: dict[str, str]) -> dict[str, Any]:
     try:
         return _request(token_url(client_id), method="POST", form=form)
@@ -377,23 +409,6 @@ def _post_token(client_id: str, form: dict[str, str]) -> dict[str, Any]:
                 f"TrueLayer needs a fresh sign-in; reconnect this bank in Securo.{detail}"
             ) from None
         raise UpstreamError(exc.status, f"TrueLayer token request failed: {exc.message}", exc.code) from None
-
-
-def _expiry(value: Any) -> dt.datetime | None:
-    if not value:
-        return None
-    try:
-        moment = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
-
-
-def _needs_refresh(expires_at: Any, now: dt.datetime | None = None) -> bool:
-    expiry = _expiry(expires_at)
-    if expiry is None:
-        return True
-    return (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(seconds=TOKEN_BUFFER_SECONDS) >= expiry
 
 
 def _refresh_token(client_id: str, client_secret: str, refresh: str) -> tuple[str, dict[str, str]]:
@@ -426,18 +441,20 @@ def _refresh_token(client_id: str, client_secret: str, refresh: str) -> tuple[st
 
 
 def _access_token(context: Any) -> tuple[str, dict[str, str]]:
-    """A usable access token and any rotated secrets Securo must store."""
+    """A fresh access token for this sync, plus the secrets Securo must store.
+
+    TrueLayer access tokens live about an hour and this plugin syncs hours
+    apart, while refresh tokens are reusable. Starting every sync with a new
+    token means a stale or unexpectedly revoked stored token can never break a
+    run — the only time we need the person is when TrueLayer refuses to refresh.
+    """
     client_id = _client_id(context)
     if not client_id:
         raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
 
-    access = str(context.secrets.get("access_token") or "")
     refresh = str(context.secrets.get("refresh_token") or "")
-    if not access or not refresh:
+    if not refresh:
         raise NeedsAuth("This TrueLayer connection hasn't finished signing in; reconnect it.")
-
-    if not _needs_refresh(context.secrets.get("expires_at")):
-        return access, {}
 
     client_secret = _client_secret(context)
     if not client_secret:
@@ -696,7 +713,15 @@ def _map_account(
 class Plugin:
     @_logged("oauth_url")
     def oauth_url(self, params: dict[str, Any], context: Any) -> dict[str, str]:
-        """Build the TrueLayer consent link for a new connection."""
+        """Build a TrueLayer link for a new or previously connected bank.
+
+        A connection that already has a refresh token uses TrueLayer's
+        lightweight ``/v1/reauthuri`` link, as truelayer2actual does, so a
+        manual reconnect reuses the same TrueLayer connection. If TrueLayer
+        says the grace window has lapsed, fall back to the full consent screen.
+        Normal syncs never call this — the reauth link is only a fallback for a
+        genuine consent expiry.
+        """
         client_id = _client_id(context)
         if not client_id:
             raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
@@ -704,6 +729,17 @@ class Plugin:
         state = str(params.get("state") or "")
         if not redirect_uri or not state:
             raise ValueError("Securo did not provide a redirect URI and state")
+
+        refresh = str(context.secrets.get("refresh_token") or "")
+        if refresh:
+            try:
+                return {"url": build_reauth_url(client_id, refresh, redirect_uri, state)}
+            except UpstreamError as exc:
+                # Reauth is only available while the old connection is still in
+                # TrueLayer's grace window. Outside it (or if the endpoint is
+                # unavailable), a full authorization is the only way back.
+                if exc.status not in (400, 401, 404):
+                    raise
         return {"url": build_auth_url(client_id, redirect_uri, state, _providers(context))}
 
     @_logged("oauth_exchange")

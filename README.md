@@ -16,7 +16,7 @@ synced records.
 | truelayer2actual | This plugin |
 | --- | --- |
 | TrueLayer hosted OAuth with client ID/secret | Securo's **Connect Bank → TrueLayer** sign-in; register Securo's callback URL in the TrueLayer console |
-| Refresh-token rotation with 60-second buffer | Same, with rotated tokens returned to Securo even if a later step fails |
+| Refresh-token rotation with 60-second buffer | A fresh token is minted at the start of every sync; rotated tokens are returned to Securo |
 | Sandbox detected from `sandbox-` client ID prefix | Same |
 | Accounts **and** cards | Both, as separate TrueLayer feeds; cards default to Securo `credit_card` accounts |
 | Stable `normalised_provider_transaction_id` for dedupe | Same, prefixed with the account ID to avoid cross-account collisions |
@@ -24,7 +24,8 @@ synced records.
 | Re-read pending transactions | Dated + `/transactions/pending` feeds merged; `pending` rows stay visible but are balance-neutral |
 | Payee from `merchant_name`, notes from `description` | Payee from `merchant_name`, description from `description`; classification becomes Securo's provider category |
 | Per-bank isolation; one dead bank doesn't stop the rest | One Securo plugin connection per bank, each with its own status and schedule |
-| Consent expiry / reauth prompts | 401/403 become `NeedsAuth`, shown as an expired bank connection with a reconnect action |
+| Consent expiry / reauth prompts | 403 becomes `NeedsAuth`; a 401 is retried with a fresh token instead of forcing a reconnect |
+| Re-consent link (`/v1/reauthuri`) | Used only when you press **Sign in again**, with full-auth fallback; never used by normal sync |
 | 429 backoff | `RateLimited`, so Securo keeps the connection healthy and retries later |
 | Six-hour sync interval | `sync_minutes: 360` in the manifest |
 
@@ -162,11 +163,17 @@ does not match. `egress refused: ... is not allowed` in
 `docker compose logs plugins-egress` means the installed manifest is stale and
 must be updated.
 
-From **1.2.1** a `401` on a data read triggers one forced token refresh and a
-retry, so an access token retired early by TrueLayer does not mark the bank as
-expired while the refresh token is still good. Only a `401` that survives that
-retry (or a `403`) needs a reconnect; the rotated tokens are saved with the
-sync.
+From **1.2.2** every sync starts by minting a fresh access token from the
+refresh token, so a stale or unexpectedly revoked stored token cannot fail a
+run. If TrueLayer still returns `401` after one extra refresh and retry, the
+connection shows a retryable error and Securo tries again on the next schedule
+— no manual reconnect. A `403` means the consent itself has gone and does need
+a reconnect.
+
+From **1.2.3** that reconnect uses TrueLayer's `/v1/reauthuri` link when the
+connection still has a refresh token, preserving the same TrueLayer connection.
+If the grace window has lapsed (HTTP 400/401/404), it falls back to the full
+consent screen. Normal sync never requests a reauth link.
 
 Version **1.1.3+** also logs one balance line per account on every sync. From
 **1.1.5** it shows both provider figures and which one was used:
@@ -213,6 +220,17 @@ Unit tests (no dependencies, Python 3.11+):
 python3 -m unittest -v
 ```
 
+To confirm the re-auth link fallback is still present (and still absent from
+the normal sync path), run:
+
+```bash
+node check_reauth.js
+```
+
+It checks the plugin source and exercises the behaviour with a short Python
+runtime check. It also checks `../truelayer2actual` when that checkout exists;
+set `TRUELAYER2ACTUAL_DIR` to check it elsewhere.
+
 ## Publish
 
 Before publishing, change `id` and `repository` in `securo-plugin.json` to
@@ -230,6 +248,7 @@ The catalog picks it up on its next rebuild (about every 6 hours).
 truelayer_plugin.py      # OAuth, TrueLayer client, mapping, sync (stdlib only)
 securo-plugin.json       # manifest: oauth integration, network, provides
 test_truelayer_plugin.py # stdlib unit tests
+check_reauth.js          # checks the reauth-link fallback is still present
 .env                     # generated local Compose settings; ignored by git
 .env.example             # sanitized production template; safe to commit
 ```
