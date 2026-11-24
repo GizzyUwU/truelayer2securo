@@ -27,7 +27,7 @@ synced records.
 | Consent expiry / reauth prompts | 403 becomes `NeedsAuth`; a 401 is retried with a fresh token instead of forcing a reconnect |
 | Re-consent link (`/v1/reauthuri`) | Used only when you press **Sign in again**, with full-auth fallback; never used by normal sync |
 | 429 backoff | `RateLimited`, so Securo keeps the connection healthy and retries later |
-| Six-hour sync interval | `sync_minutes: 360` in the manifest |
+| Hourly sync interval | `sync_minutes: 60` in the manifest; `BANK_SYNC_MIN_INTERVAL_HOURS` applies only to native bank providers, not plugins |
 
 Not applicable in Securo: Actual budget pairing and multi-budget fan-out (use
 Securo workspaces/accounts), the built-in Express dashboard (Securo's Accounts
@@ -174,6 +174,12 @@ From **1.2.3** that reconnect uses TrueLayer's `/v1/reauthuri` link when the
 connection still has a refresh token, preserving the same TrueLayer connection.
 If the grace window has lapsed (HTTP 400/401/404), it falls back to the full
 consent screen. Normal sync never requests a reauth link.
+
+From **1.2.4** the plugin's manifest schedule is hourly (`sync_minutes: 60`).
+Securo's `BANK_SYNC_MIN_INTERVAL_HOURS` env var does not control plugin
+connections; they use the manifest interval, with backoff after failures.
+Hourly is more often than PSD2's usual four unattended accesses per day, so
+only keep it if your bank/provider tolerates it.
 
 Version **1.1.3+** also logs one balance line per account on every sync. From
 **1.1.5** it shows both provider figures and which one was used:

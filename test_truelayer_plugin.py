@@ -979,6 +979,7 @@ class ManifestTests(unittest.TestCase):
         integration = manifest["contributes"]["integrations"][0]
         self.assertEqual(integration["auth"], "oauth")
         self.assertEqual(integration["provides"], ["accounts", "transactions"])
+        self.assertEqual(integration["sync_minutes"], 60)
         # Securo 0.21.0 rejects unknown integration fields; `complete_feed`
         # was added after that release, so it must stay out of the manifest.
         self.assertNotIn("complete_feed", integration)
