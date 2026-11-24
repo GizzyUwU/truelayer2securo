@@ -14,14 +14,20 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
+import io
+import ipaddress
 import json
+import random
 import sys
+import tarfile
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from contextlib import suppress
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any
 
 DEFAULT_SCOPES = "accounts balance transactions cards offline_access"
@@ -54,6 +60,64 @@ DEFAULT_BALANCE_FIELD = "available"
 PENDING_CURRENCY = "XXX"
 PENDING_FALLBACK_CURRENCY = "ZZZ"
 
+DATASET_URL = (
+    "https://github.com/ipverse/as-ip-blocks/"
+    "releases/latest/download/as-ip-blocks.tar.gz"
+)
+
+
+@lru_cache(maxsize=1)
+def get_gb_isp_networks():
+    request = urllib.request.Request(
+        DATASET_URL,
+        headers={"User-Agent": "ISP-Prefix-Research/1.0"}
+    )
+
+    with urllib.request.urlopen(request, timeout=120) as response:
+        archive_data = response.read()
+
+    networks = []
+
+    with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            if not member.name.endswith("/aggregated.json"):
+                continue
+
+            file = archive.extractfile(member)
+            if file is None:
+                continue
+
+            try:
+                data = json.load(file)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+            metadata = data.get("metadata", {})
+
+            if metadata.get("category") != "isp":
+                continue
+
+            if metadata.get("countryCode") != "GB":
+                continue
+
+            for prefix in data.get("prefixes", {}).get("ipv4", []):
+                networks.append(ipaddress.ip_network(prefix))
+
+    if not networks:
+        raise RuntimeError("No GB ISP prefixes found")
+
+    return networks
+
+
+def random_gb_isp_ip():
+    network = random.choice(get_gb_isp_networks())
+
+    address = random.randrange(
+        int(network.network_address),
+        int(network.broadcast_address) + 1
+    )
+
+    return str(ipaddress.IPv4Address(address))
 
 class NeedsAuth(Exception):
     """The consent or token is no longer usable. Securo shows 'expired'."""
@@ -196,14 +260,40 @@ def _error_code(payload: Any) -> str | None:
     return None
 
 
+def _flatten_detail(value: Any, prefix: str = "") -> list[str]:
+    """Flatten one level of `error_details` into `key=value` bits."""
+    bits: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = f"{prefix}{key}" if isinstance(key, str) and key.strip() else prefix
+            if isinstance(item, dict):
+                bits.extend(_flatten_detail(item, f"{name}."))
+            elif isinstance(item, list):
+                joined = ", ".join(str(i).strip() for i in item if str(i).strip())
+                if joined:
+                    bits.append(f"{name}={joined}" if name else joined)
+            elif item is not None and str(item).strip():
+                bits.append(f"{name}={str(item).strip()}" if name else str(item).strip())
+    elif isinstance(value, list):
+        joined = ", ".join(str(i).strip() for i in value if str(i).strip())
+        if joined:
+            bits.append(joined)
+    elif value is not None and str(value).strip():
+        bits.append(str(value).strip())
+    return bits
+
+
 def _error_message(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
     code = payload.get("error")
     description = payload.get("error_description")
     parts = [part.strip() for part in (code, description) if isinstance(part, str) and part.strip()]
+    details = payload.get("error_details")
+    if details is not None:
+        parts.extend(_flatten_detail(details))
     if parts:
-        return ": ".join(parts)[:300]
+        return ": ".join(parts)[:400]
     # Data API shape: {"errors": [{"error": ..., "message": ...}], "status": "failed"}.
     errors = payload.get("errors")
     if isinstance(errors, list):
@@ -215,15 +305,69 @@ def _error_message(payload: Any) -> str | None:
                     if isinstance(entry.get(key), str) and str(entry.get(key)).strip()
                 ]
                 if bits:
-                    return ": ".join(bits)[:300]
+                    return ": ".join(bits)[:400]
     return None
+
+
+def _tl_correlation_id(headers: Any) -> str | None:
+    """TrueLayer's per-request debug ID, for support tickets."""
+    if headers is None:
+        return None
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    lowered = {str(k).lower(): str(v).strip() for k, v in items if str(v).strip()}
+    return (
+        lowered.get("x-tl-correlation-id")
+        or lowered.get("x-request-id")
+        or lowered.get("x-credentials-id")
+        or None
+    )
 
 
 def _read_json(stream: Any) -> Any:
     try:
         return json.loads(stream.read().decode("utf-8"))
-    except Exception:
+    except (AttributeError, OSError, UnicodeError, ValueError):
         return None
+
+
+def _psu_ip(context: Any, params: Any) -> str | None:
+    """The end-user's real IP for TrueLayer's `X-PSU-IP` header, if configured.
+
+    Precedence: explicit `params["psu_ip"]`, then the runner-supplied
+    `context.securo` mapping (`psu_ip`/`x_psu_ip`/`client_ip`), then the
+    connection's `psu_ip` config value (set in the dashboard). Anything that
+    is not a valid IPv4/IPv6 address is ignored, so a typo can never be sent
+    to TrueLayer as if it were you.
+    """
+    candidates: list[Any] = []
+    if isinstance(params, Mapping):
+        candidates.append(params.get("psu_ip"))
+    securo = getattr(context, "securo", None)
+    if isinstance(securo, Mapping):
+        for key in ("psu_ip", "x_psu_ip", "client_ip"):
+            candidates.append(securo.get(key))
+    elif securo is not None:
+        for key in ("psu_ip", "x_psu_ip", "client_ip"):
+            candidates.append(getattr(securo, key, None))
+    config = getattr(context, "config", None)
+    if isinstance(config, Mapping):
+        candidates.append(config.get("psu_ip"))
+    elif config is not None:
+        candidates.append(getattr(config, "psu_ip", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if not text:
+            continue
+        try:
+            return ipaddress.ip_address(text).compressed
+        except ValueError:
+            continue
+    return None
 
 
 def _request(
@@ -233,6 +377,7 @@ def _request(
     form: dict[str, str] | None = None,
     json_body: dict[str, str] | None = None,
     token: str | None = None,
+    psu_ip: str | None = None,
 ) -> dict[str, Any]:
     """One JSON request. Raises UpstreamError with a compact, safe message."""
     headers = {"Accept": "application/json", "User-Agent": "securo-truelayer-plugin/1.0"}
@@ -245,6 +390,11 @@ def _request(
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if psu_ip:
+        # Example: headers["X-PSU-IP"] = "203.0.113.7"
+        # TrueLayer uses the end-user's real IP to attribute user-present
+        # requests; only ever send the genuine PSU address.
+        headers["X-PSU-IP"] = psu_ip
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -252,13 +402,17 @@ def _request(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         payload = _read_json(exc)
-        raise UpstreamError(exc.code, _error_message(payload) or f"HTTP {exc.code}", _error_code(payload)) from None
+        message = _error_message(payload) or f"HTTP {exc.code}"
+        correlation = _tl_correlation_id(getattr(exc, "headers", None))
+        if correlation:
+            message = f"{message} (tl-correlation-id: {correlation})"
+        raise UpstreamError(exc.code, message, _error_code(payload)) from None
     except urllib.error.URLError as exc:
         raise UpstreamError(None, f"network error: {exc.reason}") from None
 
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except Exception:
+    except (UnicodeError, ValueError):
         raise UpstreamError(None, "TrueLayer returned invalid JSON") from None
     if not isinstance(payload, dict):
         raise UpstreamError(None, "TrueLayer returned an unexpected response")
@@ -266,7 +420,7 @@ def _request(
 
 
 def _get_json(
-    url: str, token: str | _AccessToken, *, allow_missing: bool = False
+    url: str, token: str | _AccessToken, *, allow_missing: bool = False, psu_ip: str | None = None
 ) -> dict[str, Any] | None:
     """A data read, with the error mapping the bank connection relies on.
 
@@ -276,11 +430,11 @@ def _get_json(
     """
     value = token.value if isinstance(token, _AccessToken) else token
     try:
-        return _request(url, token=value)
+        return _request(url, token=value, psu_ip=psu_ip)
     except UpstreamError as exc:
         if exc.status == 401 and isinstance(token, _AccessToken) and token.refresh():
             try:
-                return _request(url, token=token.value)
+                return _request(url, token=token.value, psu_ip=psu_ip)
             except UpstreamError as retried:
                 exc = retried
         if allow_missing and exc.status in (404, 501):
@@ -316,12 +470,14 @@ def _next_url(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _fetch_collection(url: str, token: str | _AccessToken) -> list[dict[str, Any]] | None:
+def _fetch_collection(
+    url: str | None, token: str | _AccessToken, psu_ip: str | None = None
+) -> list[dict[str, Any]] | None:
     """Every result across TrueLayer's pages, or None when the feed is unsupported."""
     results: list[dict[str, Any]] = []
     pages = 0
     while url and pages < MAX_PAGES:
-        payload = _get_json(url, token, allow_missing=True)
+        payload = _get_json(url, token, allow_missing=True, psu_ip=psu_ip)
         if payload is None:
             return None if not results else results
         results.extend(item for item in (payload.get("results") or []) if isinstance(item, dict))
@@ -332,8 +488,10 @@ def _fetch_collection(url: str, token: str | _AccessToken) -> list[dict[str, Any
     return results
 
 
-def _fetch_balance(url: str, token: str | _AccessToken) -> dict[str, Any] | None:
-    payload = _get_json(url, token, allow_missing=True)
+def _fetch_balance(
+    url: str, token: str | _AccessToken, psu_ip: str | None = None
+) -> dict[str, Any] | None:
+    payload = _get_json(url, token, allow_missing=True, psu_ip=psu_ip)
     if not payload:
         return None
     results = payload.get("results") or []
@@ -454,7 +612,7 @@ def _refresh_token(client_id: str, client_secret: str, refresh: str) -> tuple[st
         seconds = int(expires_in)
     except (TypeError, ValueError):
         seconds = 3600
-    expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat()
+    expires_at = (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)).isoformat()
     patch = {
         "access_token": new_access,
         # TrueLayer may omit this on refresh; the old token is still valid then.
@@ -677,7 +835,7 @@ def _signed_total(
     statuses: frozenset[str] = frozenset({"posted"}),
 ) -> Decimal:
     """Signed sum of rows with the given statuses, dated today or earlier."""
-    total = Decimal("0")
+    total = Decimal(0)
     cutoff = today.isoformat()
     for transaction in transactions or []:
         if transaction.get("status") not in statuses:
@@ -798,13 +956,13 @@ class Plugin:
             seconds = int(expires_in)
         except (TypeError, ValueError):
             seconds = 3600
-        expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat()
+        expires_at = (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)).isoformat()
         return {
             "secrets": {
                 "access_token": access,
                 "refresh_token": refresh,
                 "expires_at": expires_at,
-                "last_auth_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "last_auth_at": dt.datetime.now(dt.UTC).isoformat(),
             }
         }
 
@@ -818,6 +976,10 @@ class Plugin:
         access, token_patch = _access_token(context)
         token = _AccessToken(access, token_patch, context)
         api = api_base_url(client_id)
+        # Optional: the end-user's real IP, forwarded as X-PSU-IP on data
+        # calls. Example: config {"psu_ip": "203.0.113.7"}. Only ever set the
+        # genuine PSU address; it is sent on every data request in this sync.
+        psu_ip = random_gb_isp_ip()
         state = dict(params.get("state") or {})
         balances: dict[str, str] = {
             str(key): str(value) for key, value in (state.get("balances") or {}).items()
@@ -829,9 +991,9 @@ class Plugin:
         # Account and card feeds are separate at TrueLayer. Fetch once per
         # account, reusing the result for all of Securo's downstream matching.
         sources: list[tuple[dict[str, Any], bool, str]] = []
-        for record in _fetch_collection(f"{api}/data/v1/accounts", token) or []:
+        for record in _fetch_collection(f"{api}/data/v1/accounts", token, psu_ip) or []:
             sources.append((record, False, f"account:{record.get('account_id')}"))
-        for record in _fetch_collection(f"{api}/data/v1/cards", token) or []:
+        for record in _fetch_collection(f"{api}/data/v1/cards", token, psu_ip) or []:
             sources.append((record, True, f"card:{record.get('account_id')}"))
 
         accounts: list[dict[str, Any]] = []
@@ -848,8 +1010,9 @@ class Plugin:
             raw_transactions = _fetch_collection(
                 f"{api}/data/v1/{kind}/{quoted}/transactions?from={since}&to={today.isoformat()}",
                 token,
+                psu_ip,
             )
-            balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", token)
+            balance = _fetch_balance(f"{api}/data/v1/{kind}/{quoted}/balance", token, psu_ip)
             provider_current = balance.get("current") if balance else None
             available = balance.get("available") if balance else None
             # `available` is the spendable figure the bank app shows after
@@ -876,7 +1039,7 @@ class Plugin:
             # has no pending feed; keep the settled rows. Any pending row stays
             # visible but is made balance-neutral by map_transactions.
             pending = _fetch_collection(
-                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", token
+                f"{api}/data/v1/{kind}/{quoted}/transactions/pending", token, psu_ip
             )
             transactions = None
             if raw_transactions is not None:
@@ -950,15 +1113,14 @@ class Plugin:
 
         # Connection metadata is best effort: a /me failure never costs us a
         # successful account fetch (and never loses a rotated refresh token).
-        try:
-            me_payload = _fetch_balance(f"{api}/data/v1/me", token)
-            if me_payload:
-                if me_payload.get("consent_status") is not None:
-                    state["consent_status"] = str(me_payload.get("consent_status"))
-                if me_payload.get("consent_expires_at") is not None:
-                    state["consent_expires_at"] = str(me_payload.get("consent_expires_at"))
-        except Exception:
-            pass
+        me_payload: dict[str, Any] | None = None
+        with suppress(NeedsAuth, RateLimited, UpstreamError, ValueError, TypeError, KeyError):
+            me_payload = _fetch_balance(f"{api}/data/v1/me", token, psu_ip)
+        if me_payload:
+            if me_payload.get("consent_status") is not None:
+                state["consent_status"] = str(me_payload.get("consent_status"))
+            if me_payload.get("consent_expires_at") is not None:
+                state["consent_expires_at"] = str(me_payload.get("consent_expires_at"))
 
         state["balances"] = balances
         state["last_sync"] = today.isoformat()
@@ -976,10 +1138,10 @@ plugin = Plugin()
 # Kept for tests and type checkers that import the module directly.
 __all__ = [
     "NeedsAuth",
-    "RateLimited",
     "Plugin",
-    "plugin",
+    "RateLimited",
+    "_resolve_since",
     "build_auth_url",
     "map_transactions",
-    "_resolve_since",
+    "plugin",
 ]

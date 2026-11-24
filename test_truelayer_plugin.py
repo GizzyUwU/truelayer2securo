@@ -964,6 +964,77 @@ class TokenRecoveryTests(unittest.TestCase):
         self.assertEqual(plugin_module._error_code(payload), "invalid_token")
         self.assertIn("Access token expired", plugin_module._error_message(payload) or "")
 
+    def test_psu_ip_header_is_sent_when_valid(self):
+        seen = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen.update({k.lower(): v for k, v in dict(request.header_items()).items()})
+            raise UpstreamError(500, "stop here")
+
+        with patch.object(plugin_module.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(UpstreamError):
+                plugin_module._request("https://api.truelayer.com/data/v1/accounts", psu_ip="203.0.113.7")
+        self.assertEqual(seen.get("x-psu-ip"), "203.0.113.7")
+
+    def test_psu_ip_config_validation_and_precedence(self):
+        params = {"psu_ip": "198.51.100.9"}
+        ctx = context(config={"psu_ip": "203.0.113.7"})
+        self.assertEqual(plugin_module._psu_ip(ctx, params), "198.51.100.9")
+        self.assertIsNone(plugin_module._psu_ip(context(config={}), {}))
+        self.assertIsNone(plugin_module._psu_ip(context(config={"psu_ip": "not-an-ip"}), {}))
+        self.assertEqual(
+            plugin_module._psu_ip(context(config={"psu_ip": " 203.0.113.7 "}), {}),
+            "203.0.113.7",
+        )
+        securo_ctx = context(config={"psu_ip": "203.0.113.7"})
+        securo_ctx.securo = {"psu_ip": "192.0.2.1"}
+        self.assertEqual(plugin_module._psu_ip(securo_ctx, {}), "192.0.2.1")
+
+    def test_sync_forwards_psu_ip_to_data_calls(self):
+        seen = []
+
+        def fake_request(url, **kwargs):
+            if "/connect/token" in url:
+                return {"access_token": "minted-access", "expires_in": 3600}
+            seen.append(kwargs.get("psu_ip"))
+            return {"results": [], "status": "success"}
+
+        ctx = context(
+            config={"client_id": "app-123", "psu_ip": "203.0.113.7"},
+            secrets={"client_secret": "secret-1", "refresh_token": "refresh-1"},
+        )
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            plugin_module.plugin.sync({}, ctx)
+        data_calls = [url for url in seen]
+        self.assertTrue(data_calls)
+        self.assertTrue(all(ip == "203.0.113.7" for ip in seen))
+
+    def test_401_detail_and_correlation_id_are_kept(self):
+        import urllib.error
+
+        payload = {
+            "error": "unauthorized",
+            "error_description": "Unauthorized.",
+            "error_details": {"reason": "consent_expired", "provider": "mock"},
+        }
+        body = json.dumps(payload).encode()
+        headers = {"X-TL-Correlation-Id": "corr-123"}
+        exc = urllib.error.HTTPError(
+            "https://api.truelayer.com/data/v1/accounts/a/transactions",
+            401,
+            "Unauthorized",
+            headers,
+            io.BytesIO(body),
+        )
+        with patch.object(plugin_module.urllib.request, "urlopen", side_effect=exc):
+            with self.assertRaises(UpstreamError) as raised:
+                plugin_module._request("https://api.truelayer.com/data/v1/accounts/a/transactions")
+        message = str(raised.exception.message)
+        self.assertIn("unauthorized", message)
+        self.assertIn("consent_expired", message)
+        self.assertIn("corr-123", message)
+        self.assertEqual(raised.exception.code, "unauthorized")
+
     def test_expired_consent_still_needs_auth(self):
         calls = []
 
@@ -995,7 +1066,7 @@ class ManifestTests(unittest.TestCase):
         # was added after that release, so it must stay out of the manifest.
         self.assertNotIn("complete_feed", integration)
         fields = {field["key"] for field in integration["fields"]}
-        self.assertTrue({"client_id", "client_secret", "balance_field"} <= fields)
+        self.assertTrue({"client_id", "client_secret", "balance_field", "psu_ip"} <= fields)
         hosts = {entry["host"] for entry in manifest["network"]}
         self.assertTrue(hosts <= plugin_module.HOSTS)
 
