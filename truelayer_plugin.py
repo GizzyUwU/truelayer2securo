@@ -182,8 +182,17 @@ def token_url(client_id: str) -> str:
 def _error_code(payload: Any) -> str | None:
     if isinstance(payload, dict):
         code = payload.get("error")
-        if isinstance(code, str):
+        if isinstance(code, str) and code.strip():
             return code.strip().lower()
+        # Data API failures use an `errors` array instead of top-level fields.
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            for entry in errors:
+                if isinstance(entry, dict):
+                    for key in ("error", "code", "type"):
+                        value = entry.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip().lower()
     return None
 
 
@@ -193,7 +202,21 @@ def _error_message(payload: Any) -> str | None:
     code = payload.get("error")
     description = payload.get("error_description")
     parts = [part.strip() for part in (code, description) if isinstance(part, str) and part.strip()]
-    return ": ".join(parts)[:300] if parts else None
+    if parts:
+        return ": ".join(parts)[:300]
+    # Data API shape: {"errors": [{"error": ..., "message": ...}], "status": "failed"}.
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for entry in errors:
+            if isinstance(entry, dict):
+                bits = [
+                    str(entry.get(key)).strip()
+                    for key in ("error", "message", "detail")
+                    if isinstance(entry.get(key), str) and str(entry.get(key)).strip()
+                ]
+                if bits:
+                    return ": ".join(bits)[:300]
+    return None
 
 
 def _read_json(stream: Any) -> Any:
@@ -264,9 +287,10 @@ def _get_json(
             return None
         if exc.status == 401:
             path = urllib.parse.urlsplit(url).path
+            detail = f": {exc.message}" if exc.message and exc.message != "HTTP 401" else ""
             raise UpstreamError(
                 401,
-                f"TrueLayer rejected the access token on {path}; Securo will retry next sync",
+                f"TrueLayer rejected the access token on {path}{detail}; Securo will retry next sync",
                 exc.code,
             ) from None
         if exc.status == 403:

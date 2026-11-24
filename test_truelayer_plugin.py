@@ -952,6 +952,17 @@ class TokenRecoveryTests(unittest.TestCase):
                 plugin_module.plugin.sync({}, self._context())
         self.assertEqual(raised.exception.status, 401)
         self.assertIn("retry", str(raised.exception))
+        # The underlying TrueLayer reason is kept so the runner log is actionable.
+        self.assertIn("access token expired", str(raised.exception))
+        self.assertIn("/data/v1/accounts", str(raised.exception))
+
+    def test_data_api_errors_array_is_parsed(self):
+        payload = {
+            "errors": [{"error": "invalid_token", "message": "Access token expired"}],
+            "status": "failed",
+        }
+        self.assertEqual(plugin_module._error_code(payload), "invalid_token")
+        self.assertIn("Access token expired", plugin_module._error_message(payload) or "")
 
     def test_expired_consent_still_needs_auth(self):
         calls = []
