@@ -179,6 +179,12 @@ connection still has a refresh token, preserving the same TrueLayer connection.
 If the grace window has lapsed (HTTP 400/401/404), it falls back to the full
 consent screen. Normal sync never requests a reauth link.
 
+From **1.2.10** the plugin reuses the stored access token until it is within
+60 seconds of expiry, then refreshes it. TrueLayer warns that refreshing too
+often can leave data calls holding a superseded token — only the newest token
+is valid. A `401` still triggers one forced refresh and retry, so an early
+token expiry does not need a reconnect.
+
 From **1.2.4** the plugin's manifest schedule is hourly (`sync_minutes: 60`).
 Securo's `BANK_SYNC_MIN_INTERVAL_HOURS` env var does not control plugin
 connections; they use the manifest interval, with backoff after failures.

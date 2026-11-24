@@ -36,6 +36,7 @@ DEFAULT_PROVIDERS = "uk-cs-mock uk-ob-all uk-oauth-all"
 DEFAULT_HISTORY_DAYS = 7
 MIN_HISTORY_DAYS = 1
 MAX_HISTORY_DAYS = 365
+TOKEN_BUFFER_SECONDS = 60
 HTTP_TIMEOUT_SECONDS = 15
 MAX_PAGES = 50
 CENT = Decimal("0.01")
@@ -830,21 +831,42 @@ def _refresh_token(client_id: str, client_secret: str, refresh: str) -> tuple[st
     return new_access, patch
 
 
-def _access_token(context: Any) -> tuple[str, dict[str, str]]:
-    """A fresh access token for this sync, plus the secrets Securo must store.
+def _expiry(value: Any) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
 
-    TrueLayer access tokens live about an hour and this plugin syncs hours
-    apart, while refresh tokens are reusable. Starting every sync with a new
-    token means a stale or unexpectedly revoked stored token can never break a
-    run — the only time we need the person is when TrueLayer refuses to refresh.
+
+def _needs_refresh(expires_at: Any, now: dt.datetime | None = None) -> bool:
+    expiry = _expiry(expires_at)
+    if expiry is None:
+        return True
+    return (now or dt.datetime.now(dt.UTC)) + dt.timedelta(seconds=TOKEN_BUFFER_SECONDS) >= expiry
+
+
+def _access_token(context: Any) -> tuple[str, dict[str, str]]:
+    """The stored access token while it is usable, otherwise a refreshed one.
+
+    TrueLayer warns that repeated refreshes can leave data calls holding a
+    superseded token: only the newest access token is valid. So we refresh
+    when the stored token is close to expiry (or TrueLayer rejects it in
+    ``_get_json``), not merely because a sync started.
     """
     client_id = _client_id(context)
     if not client_id:
         raise NeedsAuth("Add your TrueLayer client ID in the connection settings.")
 
+    access = str(context.secrets.get("access_token") or "")
     refresh = str(context.secrets.get("refresh_token") or "")
     if not refresh:
         raise NeedsAuth("This TrueLayer connection hasn't finished signing in; reconnect it.")
+
+    if access and not _needs_refresh(context.secrets.get("expires_at")):
+        return access, {}
 
     client_secret = _client_secret(context)
     if not client_secret:

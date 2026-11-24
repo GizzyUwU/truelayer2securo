@@ -5,6 +5,7 @@ Run with: python3 -m unittest -v
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import ipaddress
 import json
@@ -893,21 +894,48 @@ class SyncTests(unittest.TestCase):
 
 
 class TokenRecoveryTests(unittest.TestCase):
-    """Every sync mints a token; a rejected one must not force a reconnect."""
+    """A valid stored token is reused; a rejected one must not force a reconnect."""
 
-    def _context(self):
+    def _context(self, *, expires_at="2000-01-01T00:00:00+00:00"):
         return context(
             config={"client_id": "app-123"},
             secrets={
                 "client_secret": "secret-1",
-                # The stored token and expiry are deliberately stale/wrong.
+                # The stored token is deliberately stale; the expiry says when
+                # it must be refreshed.
                 "access_token": "stale-access",
                 "refresh_token": "refresh-1",
-                "expires_at": "2099-01-01T00:00:00+00:00",
+                "expires_at": expires_at,
             },
         )
 
-    def test_stored_access_token_is_never_used(self):
+    def test_valid_stored_access_token_is_reused_without_refresh(self):
+        used = []
+
+        def fake_request(url, **kwargs):
+            if "/connect/token" in url:
+                raise AssertionError("a valid stored token must not be refreshed")
+            used.append(kwargs.get("token"))
+            return {"results": [], "status": "success"}
+
+        valid = self._context(expires_at="2099-01-01T00:00:00+00:00")
+        with patch.object(plugin_module, "_request", side_effect=fake_request):
+            result = plugin_module.plugin.sync({}, valid)
+
+        self.assertEqual(used, ["stale-access"] * 3)
+        self.assertNotIn("secrets", result)
+
+    def test_refresh_needed_only_near_expiry(self):
+        now = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.UTC)
+        self.assertFalse(
+            plugin_module._needs_refresh((now + dt.timedelta(seconds=120)).isoformat(), now)
+        )
+        self.assertTrue(
+            plugin_module._needs_refresh((now + dt.timedelta(seconds=30)).isoformat(), now)
+        )
+        self.assertTrue(plugin_module._needs_refresh(None, now))
+
+    def test_expired_access_token_is_refreshed(self):
         used = []
 
         def fake_request(url, **kwargs):
